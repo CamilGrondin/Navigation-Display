@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>GPS Map</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            font-family: Arial, sans-serif;
+        }
+        #map {
+            position: absolute;
+            top: 0;
+            bottom: 0;
+            width: 100%;
+        }
+        .info-panel {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            background: rgba(0, 0, 0, 0.9);
+            color: white;
+            padding: 15px;
+            border-radius: 8px;
+            z-index: 1000;
+            font-size: 13px;
+            min-width: 240px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+        }
+        .info-panel h3 {
+            margin: 0 0 12px 0;
+            color: #4bd4ff;
+            font-size: 16px;
+            border-bottom: 1px solid #4bd4ff;
+            padding-bottom: 6px;
+            cursor: pointer;
+            user-select: none;
+        }
+        .info-panel h3:hover {
+            color: #2aa5cc;
+        }
+        .info-panel.collapsed {
+            min-width: 220px;
+        }
+        .info-panel.collapsed .info-content {
+            display: none;
+        }
+        .info-row {
+            margin: 6px 0;
+        }
+        .info-label {
+            color: #aaa;
+            display: inline-block;
+            width: 105px;
+            font-size: 12px;
+        }
+        .info-value {
+            color: #fff;
+            font-weight: bold;
+        }
+        .control-panel {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(0, 0, 0, 0.9);
+            color: white;
+            padding: 15px;
+            border-radius: 8px;
+            z-index: 1000;
+            font-size: 13px;
+            min-width: 260px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+        }
+        .control-panel h3 {
+            margin: 0 0 12px 0;
+            color: #ff00c4;
+            font-size: 16px;
+            border-bottom: 1px solid #ff00c4;
+            padding-bottom: 6px;
+            cursor: pointer;
+            user-select: none;
+        }
+        .control-panel h3:hover {
+            color: #cc0099;
+        }
+        .control-panel.collapsed {
+            min-width: 200px;
+        }
+        .control-panel.collapsed .control-content {
+            display: none;
+        }
+        .input-group {
+            margin: 10px 0;
+        }
+        .input-group label {
+            display: block;
+            color: #aaa;
+            font-size: 11px;
+            margin-bottom: 4px;
+            text-transform: uppercase;
+        }
+        .input-group input {
+            width: 100%;
+            padding: 6px 8px;
+            background: rgba(255, 255, 255, 0.1);
+            border: 1px solid #555;
+            border-radius: 4px;
+            color: white;
+            font-size: 13px;
+            box-sizing: border-box;
+        }
+        .input-group input:focus {
+            outline: none;
+            border-color: #4bd4ff;
+            background: rgba(255, 255, 255, 0.15);
+        }
+        .btn-group {
+            display: flex;
+            gap: 8px;
+            margin-top: 12px;
+        }
+        .btn {
+            flex: 1;
+            padding: 8px;
+            background: #ff00c4;
+            border: none;
+            border-radius: 4px;
+            color: white;
+            font-size: 12px;
+            font-weight: bold;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        .btn:hover {
+            background: #cc0099;
+        }
+        .btn-secondary {
+            background: #4bd4ff;
+        }
+        .btn-secondary:hover {
+            background: #2aa5cc;
+        }
+        .info-text {
+            font-size: 11px;
+            color: #888;
+            margin-top: 8px;
+            font-style: italic;
+        }
+    </style>
+</head>
+<body>
+    <div id="map"></div>
+    
+    <!-- Control Panel -->
+    <div class="control-panel">
+        <h3 onclick="toggleControlPanel()">✈ Contrôle Avion</h3>
+        <div class="control-content">
+            <div class="input-group">
+                <label>Latitude</label>
+                <input type="number" id="input-lat" step="0.0001" value="38.0000" placeholder="38.0000">
+            </div>
+            <div class="input-group">
+                <label>Longitude</label>
+                <input type="number" id="input-lon" step="0.0001" value="25.0000" placeholder="25.0000">
+            </div>
+            <div class="input-group">
+                <label>Cap (Heading) °</label>
+                <input type="number" id="input-heading" value="0" placeholder="0" step="1">
+            </div>
+            <div class="btn-group">
+                <button class="btn" onclick="updateAircraftPosition()">Déplacer</button>
+                <button class="btn btn-secondary" onclick="centerOnAircraft()">Centrer</button>
+            </div>
+            <div class="info-text">
+                💡 Cliquez sur la carte pour positionner l'avion
+            </div>
+        </div>
+    </div>
+
+    <!-- Info Panel -->
+    <div class="info-panel">
+        <h3 onclick="toggleInfoPanel()">GPS Information</h3>
+        <div class="info-content">
+            <div class="info-row">
+                <span class="info-label">Position:</span>
+                <span class="info-value" id="position">38.0000°N, 25.0000°E</span>
+            </div>
+            <div class="info-row">
+                <span class="info-label">Altitude:</span>
+                <span class="info-value" id="altitude">2500 FT</span>
+            </div>
+            <div class="info-row">
+                <span class="info-label">Ground Speed:</span>
+                <span class="info-value" id="speed">148 KT</span>
+            </div>
+            <div class="info-row">
+                <span class="info-label">Heading:</span>
+                <span class="info-value" id="heading">000°</span>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script>
+        // Aircraft state
+        let aircraftLat = 38.0;
+        let aircraftLon = 25.0;
+        let aircraftHeading = 0;
+        let aircraftSpeed = 148; // knots
+        let aircraftAltitude = 2500; // feet
+        
+        // Initialize map centered on Greece
+        const map = L.map('map').setView([aircraftLat, aircraftLon], 8);
+
+        // Add OpenStreetMap tiles
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: '© OpenStreetMap contributors',
+            maxZoom: 19
+        }).addTo(map);
+
+        // Create aircraft icon with rotation
+        function createAircraftIcon(heading) {
+            return L.divIcon({
+                className: 'aircraft-marker',
+                html: `<div style="transform: rotate(${heading}deg); transform-origin: center;">
+                    <svg width="36" height="36" viewBox="0 0 36 36">
+                        <defs>
+                            <!-- Dégradé vertical jaune vers orange -->
+                            <linearGradient id="aircraftGradient" x1="0%" y1="0%" x2="0%" y2="100%">
+                                <stop offset="0%" style="stop-color:#FFD700;stop-opacity:1" />
+                                <stop offset="100%" style="stop-color:#FF8C00;stop-opacity:1" />
+                            </linearGradient>
+                        </defs>
+                        <g transform="translate(18,18)">
+                            <!-- Fuselage central avec nez arrondi et queue -->
+                            <ellipse cx="0" cy="-10" rx="1.8" ry="3" fill="url(#aircraftGradient)"/>
+                            <rect x="-1.8" y="-7" width="3.6" height="14" fill="url(#aircraftGradient)"/>
+                            <ellipse cx="0" cy="7" rx="1.5" ry="2" fill="url(#aircraftGradient)"/>
+                            
+                            <!-- Ailes principales (triangles horizontaux larges) -->
+                            <path d="M -1.8,-3 L -10,-1 L -10,1 L -1.8,-1 Z" fill="url(#aircraftGradient)"/>
+                            <path d="M 1.8,-3 L 10,-1 L 10,1 L 1.8,-1 Z" fill="url(#aircraftGradient)"/>
+                            
+                            <!-- Empennage horizontal (stabilisateurs arrière) -->
+                            <path d="M -1.8,5 L -6,6.5 L -6,7.5 L -1.8,6.5 Z" fill="url(#aircraftGradient)"/>
+                            <path d="M 1.8,5 L 6,6.5 L 6,7.5 L 1.8,6.5 Z" fill="url(#aircraftGradient)"/>
+                            
+                            <!-- Empennage vertical (dérive) -->
+                            <path d="M -1,7 L 0,10 L 1,7 Z" fill="url(#aircraftGradient)"/>
+                        </g>
+                    </svg>
+                </div>`,
+                iconSize: [36, 36],
+                iconAnchor: [18, 18]
+            });
+        }
+
+        // Add aircraft marker
+        let aircraftMarker = L.marker([aircraftLat, aircraftLon], {
+            icon: createAircraftIcon(aircraftHeading),
+            draggable: false
+        }).addTo(map);
+        
+        aircraftMarker.bindPopup("<b>DA40 Aircraft</b><br>Position actuelle");
+
+        // Add waypoints
+        const waypoints = [
+            {name: 'OKIPA', lat: 37.9, lon: 25.2, color: '#ff00c4'},
+            {name: 'SABEX', lat: 38.2, lon: 24.8, color: '#4bd4ff'},
+            {name: 'ANEBI', lat: 38.5, lon: 25.5, color: '#4bd4ff'}
+        ];
+
+        waypoints.forEach(function(wp) {
+            const waypointMarker = L.circleMarker([wp.lat, wp.lon], {
+                radius: 8,
+                fillColor: wp.color,
+                color: '#fff',
+                weight: 2,
+                opacity: 1,
+                fillOpacity: 0.8
+            }).addTo(map);
+            waypointMarker.bindPopup(`<b>${wp.name}</b><br>Waypoint`);
+        });
+
+        // Draw route line
+        const routePoints = [
+            [38.0, 25.0],
+            [37.9, 25.2],
+            [38.2, 24.8],
+            [38.5, 25.5]
+        ];
+
+        L.polyline(routePoints, {
+            color: '#ff00c4',
+            weight: 3,
+            opacity: 0.7,
+            dashArray: '10, 10'
+        }).addTo(map);
+
+        // Update display function
+        function updateDisplay() {
+            document.getElementById('position').textContent = 
+                `${aircraftLat.toFixed(4)}°${aircraftLat >= 0 ? 'N' : 'S'}, ${aircraftLon.toFixed(4)}°${aircraftLon >= 0 ? 'E' : 'W'}`;
+            document.getElementById('heading').textContent = 
+                aircraftHeading.toString().padStart(3, '0') + '°';
+            document.getElementById('altitude').textContent = aircraftAltitude + ' FT';
+            document.getElementById('speed').textContent = aircraftSpeed + ' KT';
+            
+            // Update input fields
+            document.getElementById('input-lat').value = aircraftLat.toFixed(4);
+            document.getElementById('input-lon').value = aircraftLon.toFixed(4);
+            document.getElementById('input-heading').value = aircraftHeading;
+        }
+
+        // Update aircraft position from inputs
+        function updateAircraftPosition() {
+            const newLat = parseFloat(document.getElementById('input-lat').value);
+            const newLon = parseFloat(document.getElementById('input-lon').value);
+            const newHeading = parseInt(document.getElementById('input-heading').value) || 0;
+            
+            if (!isNaN(newLat) && !isNaN(newLon)) {
+                // Clamp latitude between -90 and 90
+                aircraftLat = Math.max(-90, Math.min(90, newLat));
+                // Normalize longitude between -180 and 180
+                aircraftLon = ((newLon + 180) % 360) - 180;
+                // Normalize heading between 0 and 359
+                aircraftHeading = ((newHeading % 360) + 360) % 360;
+                
+                // Update marker position and rotation
+                aircraftMarker.setLatLng([aircraftLat, aircraftLon]);
+                aircraftMarker.setIcon(createAircraftIcon(aircraftHeading));
+                
+                updateDisplay();
+            }
+        }
+
+        // Update heading when input changes in real-time
+        document.getElementById('input-heading').addEventListener('input', function() {
+            let newHeading = parseInt(this.value);
+            
+            // Si la valeur est vide ou NaN, on met 0
+            if (isNaN(newHeading)) {
+                newHeading = 0;
+            }
+            
+            // Normaliser le heading entre 0 et 359
+            aircraftHeading = ((newHeading % 360) + 360) % 360;
+            
+            // Mettre à jour le champ avec la valeur normalisée
+            this.value = aircraftHeading;
+            
+            // Update icon rotation immediately
+            aircraftMarker.setIcon(createAircraftIcon(aircraftHeading));
+            updateDisplay();
+        });
+        
+        // Gérer le passage automatique de 359 à 0 et vice versa avec les flèches
+        document.getElementById('input-heading').addEventListener('keydown', function(e) {
+            const currentValue = parseInt(this.value) || 0;
+            
+            if (e.key === 'ArrowUp') {
+                e.preventDefault();
+                let newHeading = currentValue + 1;
+                if (newHeading > 359) {
+                    newHeading = 0;
+                }
+                this.value = newHeading;
+                this.dispatchEvent(new Event('input'));
+            } else if (e.key === 'ArrowDown') {
+                e.preventDefault();
+                let newHeading = currentValue - 1;
+                if (newHeading < 0) {
+                    newHeading = 359;
+                }
+                this.value = newHeading;
+                this.dispatchEvent(new Event('input'));
+            }
+        });
+
+        // Contrôle du heading avion avec les touches A/D
+        document.addEventListener('keydown', function(e) {
+            // Ne pas agir si un input est focus
+            if (document.activeElement && document.activeElement.tagName === 'INPUT') return;
+            if (e.key === 'a' || e.key === 'A') {
+                aircraftHeading = (aircraftHeading - 1 + 360) % 360;
+                document.getElementById('input-heading').value = aircraftHeading;
+                aircraftMarker.setIcon(createAircraftIcon(aircraftHeading));
+                updateDisplay();
+            } else if (e.key === 'd' || e.key === 'D') {
+                aircraftHeading = (aircraftHeading + 1) % 360;
+                document.getElementById('input-heading').value = aircraftHeading;
+                aircraftMarker.setIcon(createAircraftIcon(aircraftHeading));
+                updateDisplay();
+            }
+        });
+
+        // Toggle control panel visibility
+        function toggleControlPanel() {
+            const panel = document.querySelector('.control-panel');
+            panel.classList.toggle('collapsed');
+        }
+
+        // Toggle info panel visibility
+        function toggleInfoPanel() {
+            const panel = document.querySelector('.info-panel');
+            panel.classList.toggle('collapsed');
+        }
+
+        // Center map on aircraft
+        function centerOnAircraft() {
+            map.setView([aircraftLat, aircraftLon], map.getZoom());
+        }
+
+        // Click on map to move aircraft
+        map.on('click', function(e) {
+            aircraftLat = e.latlng.lat;
+            aircraftLon = e.latlng.lng;
+            
+            aircraftMarker.setLatLng([aircraftLat, aircraftLon]);
+            updateDisplay();
+        });
+
+        // Initial display update
+        updateDisplay();
+    </script>
+</body>
+</html>

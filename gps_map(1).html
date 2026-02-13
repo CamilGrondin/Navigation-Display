@@ -1,0 +1,268 @@
+
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="utf-8" />
+            <title>GPS Map</title>
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+            <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+            <style>
+                html, body, #map { width: 100%; height: 100%; margin: 0; padding: 0; }
+                #map { position: relative; }
+                .faa-overlay {
+                    position: absolute;
+                    top: 0;
+                    left: 0;
+                    width: 100%;
+                    height: 100%;
+                    pointer-events: none;
+                    display: none;
+                }
+            </style>
+        </head>
+        <body>
+            <div id="map"></div>
+            <script>
+                var mapContainer = document.getElementById('map');
+                var defaultCenter = [48.8566, 2.3522];
+                var map = L.map(mapContainer, {
+                    center: defaultCenter,
+                    zoom: 8,
+                    zoomControl: true,
+                });
+
+                var streetLayer = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                    maxZoom: 19,
+                    attribution: '© OpenStreetMap contributors',
+                });
+                streetLayer.addTo(map);
+
+                var chartBundleLayer = L.tileLayer('https://wms.chartbundle.com/tms/1.0.0/sec/{z}/{x}/{y}.png', {
+                    tms: true,
+                    minZoom: 5,
+                    maxZoom: 12,
+                    attribution: 'FAA Sectional charts via ChartBundle',
+                });
+
+                var openAipApiKey = 'REMPLACEZ_AVEC_VOTRE_CLE_OPENAIP';
+                var openAipLayer = null;
+                if (openAipApiKey && openAipApiKey !== 'REMPLACEZ_AVEC_VOTRE_CLE_OPENAIP') {
+                    openAipLayer = L.tileLayer(
+                        'https://tiles.openaip.net/terrain/{z}/{x}/{y}.png?apiKey=' + openAipApiKey,
+                        {
+                            maxZoom: 15,
+                            attribution: 'Data © openAIP.net',
+                        }
+                    );
+                    map.removeLayer(streetLayer);
+                    openAipLayer.addTo(map);
+                }
+
+                var baseLayers = {
+                    'Plan OSM': streetLayer,
+                };
+                if (openAipLayer) {
+                    baseLayers['Carte Aéronautique (openAIP)'] = openAipLayer;
+                }
+                baseLayers['Sectional FAA (USA)'] = chartBundleLayer;
+
+                L.control.layers(baseLayers, null, { collapsed: false }).addTo(map);
+
+                var overlayCanvas = document.createElement('canvas');
+                overlayCanvas.className = 'faa-overlay';
+                mapContainer.appendChild(overlayCanvas);
+                var overlayCtx = overlayCanvas.getContext('2d');
+                var overlayActive = false;
+
+                function resizeOverlay() {
+                    var size = map.getSize();
+                    overlayCanvas.width = size.x;
+                    overlayCanvas.height = size.y;
+                }
+
+                function drawCompass(ctx, radius) {
+                    ctx.save();
+                    ctx.strokeStyle = '#ffffff';
+                    ctx.lineWidth = 3;
+                    ctx.beginPath();
+                    ctx.arc(0, 0, radius, 0, Math.PI * 2);
+                    ctx.stroke();
+
+                    for (var deg = 0; deg < 360; deg += 5) {
+                        var isCardinal = deg % 90 === 0;
+                        var isMajor = deg % 30 === 0;
+                        var inner = radius - (isCardinal ? 22 : isMajor ? 14 : 8);
+                        var outer = radius;
+                        var angle = (deg - 90) * (Math.PI / 180);
+                        var cos = Math.cos(angle);
+                        var sin = Math.sin(angle);
+                        ctx.beginPath();
+                        ctx.moveTo(inner * cos, inner * sin);
+                        ctx.lineTo(outer * cos, outer * sin);
+                        ctx.lineWidth = isCardinal ? 3 : isMajor ? 2 : 1;
+                        ctx.strokeStyle = '#ffffff';
+                        ctx.stroke();
+                    }
+
+                    var labels = [
+                        { text: 'N', deg: 0 },
+                        { text: 'E', deg: 90 },
+                        { text: 'S', deg: 180 },
+                        { text: 'W', deg: 270 },
+                    ];
+                    ctx.fillStyle = '#ffffff';
+                    ctx.font = Math.round(radius * 0.15) + 'px Arial';
+                    ctx.textAlign = 'center';
+                    ctx.textBaseline = 'middle';
+                    labels.forEach(function (label) {
+                        var angle = (label.deg - 90) * (Math.PI / 180);
+                        var lx = Math.cos(angle) * (radius - 38);
+                        var ly = Math.sin(angle) * (radius - 38);
+                        ctx.fillText(label.text, lx, ly);
+                    });
+                    ctx.restore();
+                }
+
+                function drawAircraft(ctx, radius) {
+                    ctx.save();
+
+                    var noseY = -radius * 0.46;
+                    var bodyHalf = radius * 0.055;
+                    var wingHalfSpan = radius * 0.34;
+                    var wingThickness = radius * 0.11;
+                    var wingTopY = -wingThickness / 2;
+                    var wingBottomY = wingThickness / 2;
+                    var tailHalfSpan = radius * 0.22;
+                    var tailThickness = radius * 0.14;
+                    var tailTopY = radius * 0.2;
+                    var tailBottomY = tailTopY + tailThickness;
+                    var tailBodyHalf = bodyHalf * 1.35;
+                    var bottomY = tailBottomY + radius * 0.08;
+                    var shoulderY = noseY + radius * 0.09;
+
+                    var rightProfile = [
+                        { x: bodyHalf, y: shoulderY },
+                        { x: bodyHalf, y: wingTopY },
+                        { x: wingHalfSpan, y: wingTopY },
+                        { x: wingHalfSpan, y: wingBottomY },
+                        { x: bodyHalf, y: wingBottomY },
+                        { x: tailBodyHalf, y: tailTopY },
+                        { x: tailHalfSpan, y: tailTopY },
+                        { x: tailHalfSpan, y: tailBottomY },
+                        { x: tailBodyHalf, y: tailBottomY },
+                        { x: tailBodyHalf, y: bottomY }
+                    ];
+
+                    ctx.beginPath();
+                    ctx.moveTo(0, noseY);
+                    ctx.quadraticCurveTo(bodyHalf, noseY + bodyHalf, bodyHalf, shoulderY);
+                    rightProfile.forEach(function (pt) {
+                        ctx.lineTo(pt.x, pt.y);
+                    });
+                    ctx.lineTo(0, bottomY + radius * 0.04);
+                    for (var i = rightProfile.length - 1; i >= 0; i--) {
+                        var mirror = rightProfile[i];
+                        ctx.lineTo(-mirror.x, mirror.y);
+                    }
+                    ctx.quadraticCurveTo(-bodyHalf, noseY + bodyHalf, 0, noseY);
+                    ctx.closePath();
+
+                    ctx.fillStyle = '#ffffff';
+                    ctx.fill();
+
+                    ctx.restore();
+                }
+
+                function drawDistanceLabel(ctx, cx, cy, radius) {
+                    var labelX = cx + radius * 0.65;
+                    var labelY = cy - radius * 0.55;
+                    var width = 90;
+                    var height = 32;
+                    ctx.save();
+                    ctx.fillStyle = '#000000';
+                    ctx.globalAlpha = 0.75;
+                    ctx.fillRect(labelX - width / 2, labelY - height / 2, width, height);
+                    ctx.globalAlpha = 1.0;
+                    ctx.strokeStyle = '#ffffff';
+                    ctx.lineWidth = 2;
+                    ctx.strokeRect(labelX - width / 2, labelY - height / 2, width, height);
+                    ctx.fillStyle = '#ffffff';
+                    ctx.font = 'bold 16px Arial';
+                    ctx.textAlign = 'center';
+                    ctx.textBaseline = 'middle';
+                    ctx.fillText('2.5 NM', labelX, labelY);
+                    ctx.restore();
+                }
+
+                function drawFaaOverlay() {
+                    if (!overlayActive) {
+                        return;
+                    }
+                    resizeOverlay();
+                    var width = overlayCanvas.width;
+                    var height = overlayCanvas.height;
+                    var cx = width / 2;
+                    var cy = height / 2;
+                    var radius = Math.min(width, height) * 0.4;
+
+                    overlayCtx.clearRect(0, 0, width, height);
+                    overlayCtx.fillStyle = '#071c3c';
+                    overlayCtx.fillRect(0, 0, width, height);
+
+                    overlayCtx.save();
+                    overlayCtx.translate(cx, cy);
+                    drawCompass(overlayCtx, radius);
+                    drawAircraft(overlayCtx, radius);
+                    overlayCtx.restore();
+
+                    drawDistanceLabel(overlayCtx, cx, cy, radius);
+                }
+
+                function setFaaOverlayActive(active) {
+                    overlayActive = active;
+                    overlayCanvas.style.display = active ? 'block' : 'none';
+                    marker.setOpacity(active ? 0 : 1);
+                    if (active) {
+                        drawFaaOverlay();
+                    }
+                }
+
+                map.on('baselayerchange', function (event) {
+                    var isFaa = event.name === 'Sectional FAA (USA)';
+                    setFaaOverlayActive(isFaa);
+                });
+
+                map.on('resize', function () {
+                    if (overlayActive) {
+                        drawFaaOverlay();
+                    } else {
+                        resizeOverlay();
+                    }
+                });
+
+                window.addEventListener('resize', function () {
+                    if (overlayActive) {
+                        drawFaaOverlay();
+                    }
+                });
+
+                var arrowSvg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 72">' +
+                    '<path fill="#1e90ff" stroke="#ffffff" stroke-width="3" d="M24 4l16 44-16-8-16 8z"/>' +
+                    '<circle cx="24" cy="58" r="6" fill="#1e90ff" stroke="#ffffff" stroke-width="3" />' +
+                '</svg>';
+                var arrowIcon = L.icon({
+                    iconUrl: 'data:image/svg+xml;utf8,' + encodeURIComponent(arrowSvg),
+                    iconSize: [32, 48],
+                    iconAnchor: [16, 24],
+                });
+
+                var marker = L.marker(defaultCenter, { icon: arrowIcon }).addTo(map);
+
+                setTimeout(function () {
+                    resizeOverlay();
+                }, 100);
+            </script>
+        </body>
+        </html>
+        

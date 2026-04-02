@@ -1,5 +1,6 @@
 import math
 import os
+import subprocess
 import sys
 from dataclasses import dataclass
 from typing import List, cast
@@ -2060,6 +2061,8 @@ class EngineDisplay(QWidget):
 
         self.setStyleSheet('background-color: black')
 
+        self._local_service_processes = []
+
 
 
         self.rpm = 0
@@ -2242,7 +2245,73 @@ class EngineDisplay(QWidget):
 
         self.timer.start(100)
 
+        self._start_local_services()
+
         self.update_display()
+
+
+    def _start_local_services(self):
+
+        data_dir = os.path.expanduser('~/tar1090/html/data')
+        http_dir = os.path.expanduser('~/tar1090/html')
+
+        try:
+            os.makedirs(http_dir, exist_ok=True)
+            os.makedirs(data_dir, exist_ok=True)
+        except Exception:
+            pass
+
+        commands = [
+            (
+                [
+                    'readsb',
+                    '--net',
+                    '--device-type',
+                    'rtlsdr',
+                    '--gain',
+                    'auto',
+                    '--write-json-every',
+                    '0.5',
+                    '--write-json',
+                    data_dir,
+                ],
+                None,
+            ),
+            ([sys.executable, '-m', 'http.server', '8081'], http_dir),
+        ]
+
+        for command, working_directory in commands:
+            try:
+                process = subprocess.Popen(
+                    command,
+                    cwd=working_directory,
+                    stdout=None,
+                    stderr=None,
+                    start_new_session=True,
+                )
+            except FileNotFoundError:
+                print(f'Commande introuvable au démarrage: {command[0]}')
+                continue
+            except Exception:
+                print(f'Impossible de démarrer: {command}')
+                continue
+            self._local_service_processes.append(process)
+
+
+    def _stop_local_services(self):
+
+        while self._local_service_processes:
+            process = self._local_service_processes.pop()
+            try:
+                process.terminate()
+            except Exception:
+                pass
+
+
+    def closeEvent(self, a0):
+
+        self._stop_local_services()
+        super().closeEvent(a0)
 
 
 

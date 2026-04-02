@@ -979,8 +979,11 @@ class GPSWidget(QWidget):
     def _fetch_aircraft_data(self):
         if not self.web_view:
             return
+        page = self.web_view.page()
+        if not page:
+            return
         # Exécuter JavaScript pour récupérer heading, track et position
-        self.web_view.page().runJavaScript(
+        page.runJavaScript(
             'JSON.stringify({heading: aircraftHeading, track: aircraftHeading, speed: aircraftSpeed, lat: aircraftLat, lon: aircraftLon, altitude: aircraftAltitude});',
             self._update_from_js
         )
@@ -1175,6 +1178,150 @@ class GreeceMapWidget(QWidget):
         layout.addWidget(content)
 
         layout.addStretch()
+
+class Tar1090Widget(QWidget):
+    """Widget affichant la carte tar1090 (ADS-B) servie localement."""
+
+    TAR1090_URL = 'http://localhost:8081'
+
+    def __init__(self):
+        super().__init__()
+        self.setStyleSheet('background-color: #1a1d24;')
+        layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        self.setLayout(layout)
+        self.web_view = None
+
+        if QWebEngineView is None:
+            self._build_placeholder(
+                'PyQtWebEngine est requis pour afficher la carte tar1090.\n'
+                'Installez pyqtwebengine.'
+            )
+            return
+
+        try:
+            self.web_view = QWebEngineView()
+            self.web_view.setContextMenuPolicy(NO_CONTEXT_MENU)
+            layout.addWidget(self.web_view)
+            self.web_view.load(QUrl(self.TAR1090_URL))
+        except Exception as exc:
+            self.web_view = None
+            self._build_placeholder(f'Erreur lors du chargement de tar1090 : {exc}')
+
+    def reload_page(self):
+        if self.web_view:
+            self.web_view.reload()
+
+    def _build_placeholder(self, message):
+        layout = self.layout()
+        if layout is None:
+            layout = QVBoxLayout(self)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.setSpacing(0)
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        layout.setContentsMargins(40, 40, 40, 40)
+        layout.setSpacing(12)
+        title = QLabel('TAR1090 – ADS-B')
+        title.setAlignment(ALIGN_CENTER)
+        title.setStyleSheet('color: #7cfaff; font: bold 20px Arial;')
+        content = QLabel(message)
+        content.setWordWrap(True)
+        content.setAlignment(ALIGN_CENTER)
+        content.setStyleSheet('color: white; font: 14px Arial;')
+        hint = QLabel(
+            'Lancez les commandes suivantes dans un terminal :\n\n'
+            'readsb --net --device-type rtlsdr --gain auto '
+            '--write-json-every 0.5 --write-json ~/tar1090/html/data\n\n'
+            'cd ~/tar1090/html && python3 -m http.server 8081'
+        )
+        hint.setWordWrap(True)
+        hint.setAlignment(ALIGN_CENTER)
+        hint.setStyleSheet('color: #aaa; font: 12px monospace;')
+        layout.addStretch()
+        layout.addWidget(title)
+        layout.addSpacing(12)
+        layout.addWidget(content)
+        layout.addSpacing(8)
+        layout.addWidget(hint)
+        layout.addStretch()
+
+
+class Tar1090Widget(QWidget):
+    """Widget affichant la carte tar1090 (ADS-B) servie localement."""
+
+    TAR1090_URL = 'http://localhost:8081'
+
+    def __init__(self):
+        super().__init__()
+        self.setStyleSheet('background-color: #1a1d24;')
+        layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        self.setLayout(layout)
+        self.web_view = None
+
+        if QWebEngineView is None:
+            self._build_placeholder(
+                'PyQtWebEngine est requis pour afficher la carte tar1090.\n'
+                'Installez pyqtwebengine.'
+            )
+            return
+
+        try:
+            self.web_view = QWebEngineView()
+            self.web_view.setContextMenuPolicy(NO_CONTEXT_MENU)
+            layout.addWidget(self.web_view)
+            self.web_view.load(QUrl(self.TAR1090_URL))
+        except Exception as exc:
+            self.web_view = None
+            self._build_placeholder(f'Erreur lors du chargement de tar1090 : {exc}')
+
+    def reload_page(self):
+        if self.web_view:
+            self.web_view.reload()
+
+    def _build_placeholder(self, message):
+        layout = self.layout()
+        if layout is None:
+            layout = QVBoxLayout(self)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.setSpacing(0)
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        layout.setContentsMargins(40, 40, 40, 40)
+        layout.setSpacing(12)
+        title = QLabel('TAR1090 \u2013 ADS-B')
+        title.setAlignment(ALIGN_CENTER)
+        title.setStyleSheet('color: #7cfaff; font: bold 20px Arial;')
+        content = QLabel(message)
+        content.setWordWrap(True)
+        content.setAlignment(ALIGN_CENTER)
+        content.setStyleSheet('color: white; font: 14px Arial;')
+        hint = QLabel(
+            'Lancez les commandes suivantes dans un terminal :\n\n'
+            'readsb --net --device-type rtlsdr --gain auto '
+            '--write-json-every 0.5 --write-json ~/tar1090/html/data\n\n'
+            'cd ~/tar1090/html && python3 -m http.server 8081'
+        )
+        hint.setWordWrap(True)
+        hint.setAlignment(ALIGN_CENTER)
+        hint.setStyleSheet('color: #aaa; font: 12px monospace;')
+        layout.addStretch()
+        layout.addWidget(title)
+        layout.addSpacing(12)
+        layout.addWidget(content)
+        layout.addSpacing(8)
+        layout.addWidget(hint)
+        layout.addStretch()
+
 
 class NavigationDisplayWidget(QWidget):
 
@@ -2048,7 +2195,9 @@ class EngineDisplay(QWidget):
 
         self.greece_widget = GreeceMapWidget()
 
-        for widget in (self.gps, self.cap_widget, self.greece_widget):
+        self.tar1090_widget = Tar1090Widget()
+
+        for widget in (self.gps, self.cap_widget, self.greece_widget, self.tar1090_widget):
 
             widget.setMinimumSize(600, 600)
 
@@ -2059,6 +2208,8 @@ class EngineDisplay(QWidget):
         self.display_tabs.addTab(self.cap_widget, 'Cap')
 
         self.display_tabs.addTab(self.greece_widget, 'Greece Map')
+
+        self.display_tabs.addTab(self.tar1090_widget, 'ADS-B Radar')
 
 
         gps_container = QWidget()

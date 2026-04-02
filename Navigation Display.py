@@ -1,14 +1,9 @@
 import math
 import os
-import queue
-import socket
-import struct
 import subprocess
 import sys
-import threading
-import time
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, cast
+from typing import List, cast
 
 from PyQt5.QtCore import QPointF, QRectF, Qt, QTimer, QUrl
 from PyQt5.QtGui import QColor, QFont, QPainter, QPen, QPolygonF
@@ -67,14 +62,6 @@ KEY_L = getattr(Qt, 'Key_L', getattr(getattr(Qt, 'Key', Qt), 'Key_L'))
 KEY_PAGE_UP = getattr(Qt, 'Key_PageUp', getattr(getattr(Qt, 'Key', Qt), 'Key_PageUp'))
 KEY_PAGE_DOWN = getattr(Qt, 'Key_PageDown', getattr(getattr(Qt, 'Key', Qt), 'Key_PageDown'))
 KEY_M = getattr(Qt, 'Key_M', getattr(getattr(Qt, 'Key', Qt), 'Key_M'))
-KEY_1 = getattr(Qt, 'Key_1', getattr(getattr(Qt, 'Key', Qt), 'Key_1'))
-KEY_2 = getattr(Qt, 'Key_2', getattr(getattr(Qt, 'Key', Qt), 'Key_2'))
-KEY_3 = getattr(Qt, 'Key_3', getattr(getattr(Qt, 'Key', Qt), 'Key_3'))
-
-try:
-    import serial  # type: ignore
-except Exception:  # pragma: no cover - optional dependency
-    serial = None
 
 
 @dataclass
@@ -84,346 +71,6 @@ class WaypointInfo:
     ete_min: float = 0.0
     altitude_constraint: str = ''
     is_active: bool = False
-
-
-MODE_JOYSTICK = 1
-MODE_XPLANE = 2
-MODE_MSP = 3
-
-MODE_NAMES = {
-    MODE_JOYSTICK: 'JOYSTICK',
-    MODE_XPLANE: 'XPLANE',
-    MODE_MSP: 'MSP',
-}
-
-
-def _normalize_heading(value: float) -> float:
-    return value % 360.0
-
-
-@dataclass
-class EngineTelemetry:
-    rpm: float = 0.0
-    load: float = 0.0
-    fflow: float = 0.0
-    oil_psi: float = 0.0
-    oil_temp: float = 0.0
-    egt: float = 1200.0
-    fuel_temp_left: float = 60.0
-    fuel_temp_right: float = 60.0
-    fuel_qty_L: float = 60.0
-    fuel_qty_R: float = 60.0
-    heading: float = 0.0
-    track: float = 0.0
-    desired_track: float = 0.0
-    ground_speed: float = 0.0
-    true_airspeed: float = 0.0
-    lat: float = 38.0
-    lon: float = 25.0
-
-    def as_dict(self) -> Dict[str, float]:
-        return {
-            'rpm': self.rpm,
-            'load': self.load,
-            'fflow': self.fflow,
-            'oil_psi': self.oil_psi,
-            'oil_temp': self.oil_temp,
-            'egt': self.egt,
-            'fuel_temp_left': self.fuel_temp_left,
-            'fuel_temp_right': self.fuel_temp_right,
-            'fuel_qty_L': self.fuel_qty_L,
-            'fuel_qty_R': self.fuel_qty_R,
-            'heading': self.heading,
-            'track': self.track,
-            'desired_track': self.desired_track,
-            'ground_speed': self.ground_speed,
-            'true_airspeed': self.true_airspeed,
-            'lat': self.lat,
-            'lon': self.lon,
-        }
-
-
-class EngineModeSource:
-    def start(self) -> None:
-        pass
-
-    def stop(self) -> None:
-        pass
-
-    def poll(self) -> Optional[Dict[str, float]]:
-        return None
-
-
-class ManualModeSource(EngineModeSource):
-    def poll(self) -> Optional[Dict[str, float]]:
-        return None
-
-
-class XPlaneRealtimeSource(EngineModeSource):
-    def __init__(self, ip: str, port: int, snapshot_provider: Callable[[], EngineTelemetry]) -> None:
-        self.ip = ip
-        self.port = port
-        self._snapshot_provider = snapshot_provider
-        self.data_queue: 'queue.Queue[Dict[str, float]]' = queue.Queue(maxsize=200)
-        self.error_queue: 'queue.Queue[Exception]' = queue.Queue(maxsize=1)
-        self.thread: Optional[threading.Thread] = None
-        self._running = threading.Event()
-
-    def start(self) -> None:
-        if self.thread is not None and self.thread.is_alive():
-            return
-        self._running.set()
-        self.thread = threading.Thread(target=self._worker, daemon=True)
-        self.thread.start()
-
-    def stop(self) -> None:
-        self._running.clear()
-
-    def _worker(self) -> None:
-        sock = None
-        try:
-            telemetry = self._snapshot_provider()
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.bind(('', self.port))
-            sock.settimeout(0.2)
-
-            while self._running.is_set():
-                try:
-                    packet, _ = sock.recvfrom(4096)
-                except socket.timeout:
-                    continue
-                data = self._parse_data_packet(packet)
-                if not data:
-                    continue
-
-                heading = float(data.get('heading', telemetry.heading))
-                tas = float(data.get('tas', telemetry.true_airspeed))
-                ias = float(data.get('ias', telemetry.ground_speed))
-                vertical_speed = float(data.get('vertical_speed', 0.0))
-
-                telemetry.heading = _normalize_heading(heading)
-                telemetry.track = telemetry.heading
-                telemetry.desired_track = telemetry.heading
-                telemetry.true_airspeed = max(0.0, tas)
-                telemetry.ground_speed = max(0.0, ias)
-
-                # Estimateur moteur derive des donnees de vol recues.
-                telemetry.rpm = max(700.0, min(3000.0, 650.0 + telemetry.true_airspeed * 11.0))
-                telemetry.load = max(0.0, min(100.0, (telemetry.rpm - 700.0) / 23.0))
-                telemetry.fflow = max(0.0, min(20.0, telemetry.load * 0.14))
-                telemetry.oil_psi = max(0.0, min(100.0, 18.0 + telemetry.load * 0.55))
-                telemetry.oil_temp = max(50.0, min(300.0, 130.0 + telemetry.load * 1.1))
-                telemetry.egt = max(1000.0, min(1800.0, 1080.0 + telemetry.load * 4.8))
-                telemetry.fuel_temp_left = max(-40.0, min(160.0, 55.0 + telemetry.load * 0.35))
-                telemetry.fuel_temp_right = max(-40.0, min(160.0, 56.0 + telemetry.load * 0.34))
-
-                burn = telemetry.fflow * 0.0008
-                telemetry.fuel_qty_L = max(0.0, telemetry.fuel_qty_L - burn)
-                telemetry.fuel_qty_R = max(0.0, telemetry.fuel_qty_R - burn)
-
-                if self.data_queue.full():
-                    try:
-                        self.data_queue.get_nowait()
-                    except queue.Empty:
-                        pass
-                self.data_queue.put(telemetry.as_dict())
-
-        except Exception as exc:
-            if self.error_queue.empty():
-                self.error_queue.put(exc)
-        finally:
-            if sock is not None:
-                try:
-                    sock.close()
-                except Exception:
-                    pass
-
-    def _parse_data_packet(self, packet: bytes) -> Dict[str, float]:
-        if len(packet) < 5 or not packet.startswith(b'DATA'):
-            return {}
-        payload = packet[5:]
-        chunk_size = 36
-        parsed: Dict[str, float] = {}
-        for i in range(0, len(payload), chunk_size):
-            chunk = payload[i : i + chunk_size]
-            if len(chunk) != chunk_size:
-                continue
-            try:
-                idx, a, b, c, d, e, f, g, h = struct.unpack('<i8f', chunk)
-            except Exception:
-                continue
-            if idx == 3:
-                # Speeds (kts): best-effort mapping.
-                parsed['ias'] = float(a)
-                parsed['tas'] = float(b) if b > 0 else float(a)
-            elif idx == 17:
-                # Pitch / roll / heading.
-                parsed['heading'] = float(c)
-            elif idx == 20:
-                # Vertical speed in ft/min often available here depending on version.
-                parsed['vertical_speed'] = float(h if h != 0.0 else d)
-        return parsed
-
-    def poll(self) -> Optional[Dict[str, float]]:
-        if not self.error_queue.empty():
-            raise RuntimeError('X-Plane source stopped: ' + str(self.error_queue.get()))
-        try:
-            return self.data_queue.get_nowait()
-        except queue.Empty:
-            return None
-
-
-class MSPClient:
-    MSP_ATTITUDE = 108
-    MSP_ALTITUDE = 109
-
-    def __init__(self, port: str, baudrate: int, timeout: float = 0.25) -> None:
-        if serial is None:
-            raise RuntimeError('pyserial est requis pour le mode MSP: pip install pyserial')
-        self.port = port
-        self.baudrate = baudrate
-        self.timeout = timeout
-        self.conn = serial.Serial(port=port, baudrate=baudrate, timeout=timeout)
-
-    def close(self) -> None:
-        try:
-            self.conn.close()
-        except Exception:
-            pass
-
-    def _checksum(self, payload: bytes) -> int:
-        crc = 0
-        for b in payload:
-            crc ^= b
-        return crc
-
-    def _request(self, cmd: int) -> None:
-        frame_body = bytes([0, cmd])
-        frame = b'$M<' + frame_body + bytes([self._checksum(frame_body)])
-        self.conn.write(frame)
-
-    def _read_frame(self) -> Optional[tuple[int, bytes]]:
-        deadline = time.monotonic() + self.timeout
-        while time.monotonic() < deadline:
-            if self.conn.read(1) != b'$':
-                continue
-            if self.conn.read(1) != b'M':
-                continue
-            direction = self.conn.read(1)
-            if direction not in (b'>', b'!'):
-                continue
-            size_raw = self.conn.read(1)
-            cmd_raw = self.conn.read(1)
-            if len(size_raw) != 1 or len(cmd_raw) != 1:
-                return None
-            size = size_raw[0]
-            cmd = cmd_raw[0]
-            payload = self.conn.read(size)
-            crc_raw = self.conn.read(1)
-            if len(payload) != size or len(crc_raw) != 1:
-                return None
-            frame_body = size_raw + cmd_raw + payload
-            if self._checksum(frame_body) != crc_raw[0]:
-                continue
-            if direction == b'!':
-                return None
-            return cmd, payload
-        return None
-
-    def request(self, cmd: int) -> Optional[bytes]:
-        self._request(cmd)
-        frame = self._read_frame()
-        if frame is None:
-            return None
-        frame_cmd, payload = frame
-        if frame_cmd != cmd:
-            return None
-        return payload
-
-
-class MSPRealtimeSource(EngineModeSource):
-    def __init__(self, port: str, baudrate: int, snapshot_provider: Callable[[], EngineTelemetry]) -> None:
-        self.port = port
-        self.baudrate = baudrate
-        self._snapshot_provider = snapshot_provider
-        self.data_queue: 'queue.Queue[Dict[str, float]]' = queue.Queue(maxsize=200)
-        self.error_queue: 'queue.Queue[Exception]' = queue.Queue(maxsize=1)
-        self.thread: Optional[threading.Thread] = None
-        self._running = threading.Event()
-
-    def start(self) -> None:
-        if self.thread is not None and self.thread.is_alive():
-            return
-        self._running.set()
-        self.thread = threading.Thread(target=self._worker, daemon=True)
-        self.thread.start()
-
-    def stop(self) -> None:
-        self._running.clear()
-
-    def _worker(self) -> None:
-        client = None
-        try:
-            telemetry = self._snapshot_provider()
-            client = MSPClient(self.port, self.baudrate)
-
-            while self._running.is_set():
-                att_payload = client.request(MSPClient.MSP_ATTITUDE)
-                if att_payload is not None and len(att_payload) >= 6:
-                    angx, angy, heading = struct.unpack('<hhh', att_payload[:6])
-                    roll = float(angx) / 10.0
-                    pitch = float(angy) / 10.0
-                    telemetry.heading = _normalize_heading(float(heading))
-                    telemetry.track = telemetry.heading
-                    telemetry.desired_track = telemetry.heading
-
-                    synthetic_ias = 85.0 + min(70.0, abs(roll) * 0.6 + abs(pitch) * 0.8)
-                    telemetry.ground_speed = synthetic_ias
-                    telemetry.true_airspeed = synthetic_ias + 2.0
-
-                alt_payload = client.request(MSPClient.MSP_ALTITUDE)
-                if alt_payload is not None and len(alt_payload) >= 6:
-                    _, vario_cms = struct.unpack('<ih', alt_payload[:6])
-                    vertical_speed = float(vario_cms) * 1.96850394
-                else:
-                    vertical_speed = 0.0
-
-                telemetry.rpm = max(700.0, min(3000.0, 1550.0 + telemetry.true_airspeed * 7.5))
-                telemetry.load = max(0.0, min(100.0, (telemetry.rpm - 700.0) / 23.0))
-                telemetry.fflow = max(0.0, min(20.0, telemetry.load * 0.12))
-                telemetry.oil_psi = max(0.0, min(100.0, 22.0 + telemetry.load * 0.48))
-                telemetry.oil_temp = max(50.0, min(300.0, 126.0 + telemetry.load * 0.95))
-                telemetry.egt = max(1000.0, min(1800.0, 1060.0 + telemetry.load * 4.4))
-                telemetry.fuel_temp_left = max(-40.0, min(160.0, 53.0 + telemetry.load * 0.30))
-                telemetry.fuel_temp_right = max(-40.0, min(160.0, 54.0 + telemetry.load * 0.29))
-
-                burn = telemetry.fflow * (0.0007 + min(0.0005, abs(vertical_speed) / 200000.0))
-                telemetry.fuel_qty_L = max(0.0, telemetry.fuel_qty_L - burn)
-                telemetry.fuel_qty_R = max(0.0, telemetry.fuel_qty_R - burn)
-
-                if self.data_queue.full():
-                    try:
-                        self.data_queue.get_nowait()
-                    except queue.Empty:
-                        pass
-                self.data_queue.put(telemetry.as_dict())
-                time.sleep(0.05)
-
-        except Exception as exc:
-            if self.error_queue.empty():
-                self.error_queue.put(exc)
-        finally:
-            if client is not None:
-                client.close()
-
-    def poll(self) -> Optional[Dict[str, float]]:
-        if not self.error_queue.empty():
-            raise RuntimeError('MSP source stopped: ' + str(self.error_queue.get()))
-        try:
-            return self.data_queue.get_nowait()
-        except queue.Empty:
-            return None
 
 
 class RPMGauge(QWidget):
@@ -1943,10 +1590,7 @@ class NavigationDisplayWidget(QWidget):
 
         painter.drawText(banner_rect.adjusted(14, 8, -com_block_width, -32), ALIGN_LEFT | ALIGN_VCENTER, text)
 
-        speed_text = (
-            f"ENG {self.approach_mode:<10}  GS {int(self.ground_speed):3d} KT"
-            f"    TAS {int(self.true_airspeed):3d} KT"
-        )
+        speed_text = f"GS {int(self.ground_speed):3d} KT    TAS {int(self.true_airspeed):3d} KT"
 
         painter.drawText(banner_rect.adjusted(14, 32, -com_block_width, -4), ALIGN_LEFT | ALIGN_VCENTER, speed_text)
 
@@ -2451,14 +2095,6 @@ class EngineDisplay(QWidget):
         ]
 
         self.nav_mode = 'ARC'
-        self.engine_mode = MODE_JOYSTICK
-        self.engine_mode_name = MODE_NAMES[MODE_JOYSTICK]
-        self._mode_sources: Dict[int, EngineModeSource] = {}
-        self._mode_source: Optional[EngineModeSource] = None
-        self.xplane_ip = os.environ.get('XPLANE_IP', '127.0.0.1')
-        self.xplane_port = int(os.environ.get('XPLANE_UDP_PORT', '49000'))
-        self.msp_port = os.environ.get('MSP_PORT', 'COM3')
-        self.msp_baudrate = int(os.environ.get('MSP_BAUDRATE', '115200'))
 
 
 
@@ -2555,9 +2191,6 @@ class EngineDisplay(QWidget):
 
         self.setFocusPolicy(STRONG_FOCUS)
 
-        self._setup_engine_modes()
-        self.set_engine_mode(MODE_JOYSTICK)
-
         self.timer = QTimer(self)
 
         self.timer.timeout.connect(self.update_display)
@@ -2567,102 +2200,6 @@ class EngineDisplay(QWidget):
         self._start_local_services()
 
         self.update_display()
-
-
-    def _get_mode_snapshot(self):
-
-        return EngineTelemetry(
-            rpm=float(self.rpm),
-            load=float(self.load),
-            fflow=float(self.fflow),
-            oil_psi=float(self.oil_psi),
-            oil_temp=float(self.oil_temp),
-            egt=float(self.egt),
-            fuel_temp_left=float(self.fuel_temp_left),
-            fuel_temp_right=float(self.fuel_temp_right),
-            fuel_qty_L=float(self.fuel_qty_L),
-            fuel_qty_R=float(self.fuel_qty_R),
-            heading=float(self.heading),
-            track=float(self.track),
-            desired_track=float(self.desired_track),
-            ground_speed=float(self.ground_speed),
-            true_airspeed=float(self.true_airspeed),
-            lat=float(self.lat),
-            lon=float(self.lon),
-        )
-
-
-    def _setup_engine_modes(self):
-
-        self._mode_sources = {
-            MODE_JOYSTICK: ManualModeSource(),
-            MODE_XPLANE: XPlaneRealtimeSource(self.xplane_ip, self.xplane_port, self._get_mode_snapshot),
-            MODE_MSP: MSPRealtimeSource(self.msp_port, self.msp_baudrate, self._get_mode_snapshot),
-        }
-
-
-    def set_engine_mode(self, mode):
-
-        source = self._mode_sources.get(mode)
-        if source is None:
-            return
-
-        if self._mode_source is not None:
-            try:
-                self._mode_source.stop()
-            except Exception:
-                pass
-
-        self._mode_source = source
-        self.engine_mode = mode
-        self.engine_mode_name = MODE_NAMES.get(mode, 'UNKNOWN')
-        self.approach_mode = self.engine_mode_name
-
-        try:
-            self._mode_source.start()
-        except Exception as exc:
-            print(f'Erreur mode moteur {self.engine_mode_name}: {exc}')
-            if mode != MODE_JOYSTICK:
-                self._mode_source = self._mode_sources.get(MODE_JOYSTICK)
-                self.engine_mode = MODE_JOYSTICK
-                self.engine_mode_name = MODE_NAMES[MODE_JOYSTICK]
-                self.approach_mode = self.engine_mode_name
-
-
-    def cycle_engine_mode(self):
-
-        available = sorted(self._mode_sources.keys())
-        if not available:
-            return self.engine_mode_name
-        try:
-            idx = available.index(self.engine_mode)
-        except ValueError:
-            idx = 0
-        next_mode = available[(idx + 1) % len(available)]
-        self.set_engine_mode(next_mode)
-        return self.engine_mode_name
-
-
-    def _apply_mode_data(self, data):
-
-        if not data:
-            return
-        for key, value in data.items():
-            if hasattr(self, key):
-                setattr(self, key, value)
-
-
-    def _poll_engine_mode(self):
-
-        if self._mode_source is None:
-            return
-        try:
-            data = self._mode_source.poll()
-        except Exception as exc:
-            print(f'Erreur polling mode {self.engine_mode_name}: {exc}')
-            self.set_engine_mode(MODE_JOYSTICK)
-            return
-        self._apply_mode_data(data)
 
 
     def _start_local_services(self):
@@ -2725,12 +2262,6 @@ class EngineDisplay(QWidget):
 
     def closeEvent(self, a0):
 
-        if self._mode_source is not None:
-            try:
-                self._mode_source.stop()
-            except Exception:
-                pass
-
         self._stop_local_services()
         super().closeEvent(a0)
 
@@ -2760,8 +2291,6 @@ class EngineDisplay(QWidget):
 
 
     def update_display(self):
-
-        self._poll_engine_mode()
 
         self.rpm_widget.setValue(self.rpm)
 
@@ -2864,50 +2393,6 @@ class EngineDisplay(QWidget):
             return
 
         key = a0.key()
-
-        if key == KEY_1:
-            self.set_engine_mode(MODE_JOYSTICK)
-            self.update_display()
-            return
-        elif key == KEY_2:
-            self.set_engine_mode(MODE_XPLANE)
-            self.update_display()
-            return
-        elif key == KEY_3:
-            self.set_engine_mode(MODE_MSP)
-            self.update_display()
-            return
-
-        manual_keys = {
-            KEY_UP,
-            KEY_DOWN,
-            KEY_RIGHT,
-            KEY_LEFT,
-            KEY_W,
-            KEY_S,
-            KEY_E,
-            KEY_D,
-            KEY_R,
-            KEY_F,
-            KEY_T,
-            KEY_G,
-            KEY_Y,
-            KEY_H,
-            KEY_I,
-            KEY_K,
-            KEY_Z,
-            KEY_X,
-            KEY_C,
-            KEY_V,
-            KEY_U,
-            KEY_J,
-            KEY_O,
-            KEY_L,
-            KEY_PAGE_UP,
-            KEY_PAGE_DOWN,
-        }
-        if self.engine_mode != MODE_JOYSTICK and key in manual_keys:
-            return
 
         if key == KEY_UP:
 

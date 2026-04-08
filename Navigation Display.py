@@ -1,9 +1,14 @@
 import math
 import os
+import queue
+import socket
 import subprocess
+import struct
 import sys
+import threading
+import time
 from dataclasses import dataclass
-from typing import List, cast
+from typing import Dict, List, Optional, cast
 
 from PyQt5.QtCore import QPointF, QRectF, Qt, QTimer, QUrl
 from PyQt5.QtGui import QColor, QFont, QPainter, QPen, QPolygonF
@@ -22,6 +27,11 @@ try:
     from PyQt5.QtWebEngineWidgets import QWebEngineView
 except ImportError:  # pragma: no cover - optional dependency
     QWebEngineView = None
+
+try:
+    import serial  # type: ignore
+except ImportError:  # pragma: no cover - optional dependency
+    serial = None
 
 
 ALIGN_CENTER = getattr(Qt, 'AlignCenter', getattr(getattr(Qt, 'AlignmentFlag', Qt), 'AlignCenter'))
@@ -63,6 +73,10 @@ KEY_PAGE_UP = getattr(Qt, 'Key_PageUp', getattr(getattr(Qt, 'Key', Qt), 'Key_Pag
 KEY_PAGE_DOWN = getattr(Qt, 'Key_PageDown', getattr(getattr(Qt, 'Key', Qt), 'Key_PageDown'))
 KEY_M = getattr(Qt, 'Key_M', getattr(getattr(Qt, 'Key', Qt), 'Key_M'))
 
+MODE_MANUAL = 1
+MODE_XPLANE = 2
+MODE_MSP = 3
+
 
 @dataclass
 class WaypointInfo:
@@ -71,6 +85,378 @@ class WaypointInfo:
     ete_min: float = 0.0
     altitude_constraint: str = ''
     is_active: bool = False
+
+
+def prompt_text(label: str, default: Optional[str] = None) -> str:
+    suffix = f" [{default}]" if default is not None else ''
+    value = input(f"{label}{suffix}: ").strip()
+    if value:
+        return value
+    if default is not None:
+        return default
+    raise ValueError(f'{label} est requis')
+
+
+def prompt_int(label: str, default: Optional[int] = None) -> int:
+    while True:
+        value = prompt_text(label, str(default) if default is not None else None)
+        try:
+            return int(value)
+        except ValueError:
+            print('Veuillez entrer un nombre entier valide.')
+
+
+def choose_mode() -> int:
+    print('Navigation Display')
+    print('1 - Controle manuel (clavier)')
+    print('2 - Donnees temps reel X-Plane (UDP)')
+    print('3 - Donnees GPS MSP (port serie)')
+    while True:
+        mode = prompt_int('Choisir le mode', 2)
+        if mode in (MODE_MANUAL, MODE_XPLANE, MODE_MSP):
+            return mode
+        print('Le mode doit etre 1, 2 ou 3.')
+
+
+class XPlaneUDPRealtimeSource:
+
+    # id -> dataref
+    DATAREFS = {
+        1: 'sim/flightmodel/position/true_psi',
+        2: 'sim/flightmodel/position/hpath',
+        3: 'sim/flightmodel/position/groundspeed',
+        4: 'sim/flightmodel/position/latitude',
+        5: 'sim/flightmodel/position/longitude',
+        6: 'sim/flightmodel/position/elevation',
+        10: 'sim/cockpit2/engine/indicators/engine_speed_rpm[0]',
+        11: 'sim/cockpit2/engine/indicators/engine_power_hp[0]',
+        12: 'sim/cockpit2/engine/indicators/fuel_flow_kg_sec[0]',
+        13: 'sim/cockpit2/engine/indicators/oil_pressure_psi[0]',
+        14: 'sim/cockpit2/engine/indicators/oil_temperature_deg_C[0]',
+        15: 'sim/cockpit2/engine/indicators/EGT_deg_C[0]',
+        16: 'sim/cockpit2/fuel/fuel_quantity[0]',
+        17: 'sim/cockpit2/fuel/fuel_quantity[1]',
+    }
+
+    def __init__(self, ip: str, port: int, local_port: int = 49005, frequency_hz: int = 10):
+        self.ip = ip
+        self.port = int(port)
+        self.local_port = int(local_port)
+        self.frequency_hz = int(max(1, frequency_hz))
+        self.data_queue: 'queue.Queue[Dict[str, float]]' = queue.Queue(maxsize=200)
+        self.error_queue: 'queue.Queue[Exception]' = queue.Queue(maxsize=1)
+        self.thread: Optional[threading.Thread] = None
+        self._running = threading.Event()
+
+    def _build_subscribe_packet(self, request_id: int, dataref: str) -> bytes:
+        payload = struct.pack('<ii400s', self.frequency_hz, request_id, dataref.encode('ascii'))
+        return b'RREF\x00' + payload
+
+    def _build_unsubscribe_packet(self, request_id: int, dataref: str) -> bytes:
+        payload = struct.pack('<ii400s', 0, request_id, dataref.encode('ascii'))
+        return b'RREF\x00' + payload
+
+    def start(self):
+        if self.thread is not None:
+            return
+        self._running.set()
+        self.thread = threading.Thread(target=self._worker, daemon=True)
+        self.thread.start()
+        print(f'Mode 2 actif: X-Plane UDP {self.ip}:{self.port} (local:{self.local_port})')
+
+    def stop(self):
+        self._running.clear()
+
+    def _worker(self):
+        sock = None
+        fuel_kg_per_gallon = 2.72155
+        max_tank_gallons = 14.0
+        latest = {
+            'heading': 0.0,
+            'track': 0.0,
+            'ground_speed': 0.0,
+            'lat': 38.0,
+            'lon': 25.0,
+            'altitude_m': 0.0,
+            'rpm': 0.0,
+            'load': 0.0,
+            'fflow': 0.0,
+            'oil_psi': 0.0,
+            'oil_temp': 100.0,
+            'egt': 1200.0,
+            'fuel_qty_L': 50.0,
+            'fuel_qty_R': 50.0,
+        }
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(0.25)
+            sock.bind(('', self.local_port))
+
+            for request_id, dataref in self.DATAREFS.items():
+                sock.sendto(self._build_subscribe_packet(request_id, dataref), (self.ip, self.port))
+
+            last_refresh = time.monotonic()
+            while self._running.is_set():
+                try:
+                    packet, _ = sock.recvfrom(4096)
+                except socket.timeout:
+                    packet = b''
+
+                now = time.monotonic()
+                if now - last_refresh > 3.0:
+                    for request_id, dataref in self.DATAREFS.items():
+                        sock.sendto(self._build_subscribe_packet(request_id, dataref), (self.ip, self.port))
+                    last_refresh = now
+
+                if not packet or not packet.startswith(b'RREF,'):
+                    continue
+
+                updated = False
+                payload = packet[5:]
+                for offset in range(0, len(payload), 8):
+                    chunk = payload[offset:offset + 8]
+                    if len(chunk) != 8:
+                        continue
+                    request_id, value = struct.unpack('<if', chunk)
+                    if request_id == 1:
+                        latest['heading'] = float(value) % 360.0
+                        updated = True
+                    elif request_id == 2:
+                        latest['track'] = float(value) % 360.0
+                        updated = True
+                    elif request_id == 3:
+                        latest['ground_speed'] = float(value) * 1.943844
+                        updated = True
+                    elif request_id == 4:
+                        latest['lat'] = float(value)
+                        updated = True
+                    elif request_id == 5:
+                        latest['lon'] = float(value)
+                        updated = True
+                    elif request_id == 6:
+                        latest['altitude_m'] = float(value)
+                        updated = True
+                    elif request_id == 10:
+                        latest['rpm'] = max(0.0, float(value))
+                        updated = True
+                    elif request_id == 11:
+                        # DA40 Lycoming IO-360 ~168 HP (utilise pour approx % load)
+                        latest['load'] = max(0.0, min(100.0, float(value) / 168.0 * 100.0))
+                        updated = True
+                    elif request_id == 12:
+                        kg_sec = max(0.0, float(value))
+                        latest['fflow'] = kg_sec * 3600.0 / fuel_kg_per_gallon
+                        updated = True
+                    elif request_id == 13:
+                        latest['oil_psi'] = max(0.0, float(value))
+                        updated = True
+                    elif request_id == 14:
+                        temp_c = float(value)
+                        latest['oil_temp'] = temp_c * 9.0 / 5.0 + 32.0
+                        updated = True
+                    elif request_id == 15:
+                        temp_c = float(value)
+                        latest['egt'] = temp_c * 9.0 / 5.0 + 32.0
+                        updated = True
+                    elif request_id == 16:
+                        raw = max(0.0, float(value))
+                        gallons = raw if raw <= 20.0 else raw / fuel_kg_per_gallon
+                        latest['fuel_qty_L'] = max(0.0, min(100.0, gallons / max_tank_gallons * 100.0))
+                        updated = True
+                    elif request_id == 17:
+                        raw = max(0.0, float(value))
+                        gallons = raw if raw <= 20.0 else raw / fuel_kg_per_gallon
+                        latest['fuel_qty_R'] = max(0.0, min(100.0, gallons / max_tank_gallons * 100.0))
+                        updated = True
+
+                if updated:
+                    if self.data_queue.full():
+                        try:
+                            self.data_queue.get_nowait()
+                        except queue.Empty:
+                            pass
+                    self.data_queue.put(dict(latest))
+        except Exception as exc:
+            if self.error_queue.empty():
+                self.error_queue.put(exc)
+        finally:
+            if sock is not None:
+                try:
+                    for request_id, dataref in self.DATAREFS.items():
+                        sock.sendto(self._build_unsubscribe_packet(request_id, dataref), (self.ip, self.port))
+                except Exception:
+                    pass
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+
+    def poll(self, timeout: float = 0.05) -> Optional[Dict[str, float]]:
+        if not self.error_queue.empty():
+            raise RuntimeError(f'Source X-Plane arretee: {self.error_queue.get()}')
+        try:
+            return self.data_queue.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+
+class MSPGPSRealtimeSource:
+
+    MSP_GPS = 106
+    HEADER_REQUEST = b'$M<'
+    HEADER_RESPONSE = b'$M>'
+
+    def __init__(self, port: str, baudrate: int, timeout: float = 0.35):
+        if serial is None:
+            raise RuntimeError('pyserial est requis pour le mode MSP. Installez: pip install pyserial')
+        self.port = port
+        self.baudrate = baudrate
+        self.timeout = timeout
+        self.data_queue: 'queue.Queue[Dict[str, float]]' = queue.Queue(maxsize=120)
+        self.error_queue: 'queue.Queue[Exception]' = queue.Queue(maxsize=1)
+        self.thread: Optional[threading.Thread] = None
+        self._running = threading.Event()
+
+    def start(self):
+        if self.thread is not None:
+            return
+        self._running.set()
+        self.thread = threading.Thread(target=self._worker, daemon=True)
+        self.thread.start()
+        print(f'Mode MSP actif sur {self.port} @ {self.baudrate} bauds')
+
+    def stop(self):
+        self._running.clear()
+
+    def _build_request(self, cmd: int) -> bytes:
+        checksum = cmd
+        return self.HEADER_REQUEST + bytes((0, cmd, checksum))
+
+    def _read_exact(self, conn, count: int, timeout: float) -> Optional[bytes]:
+        buffer = bytearray()
+        deadline = time.monotonic() + timeout
+        while len(buffer) < count and time.monotonic() < deadline:
+            chunk = conn.read(count - len(buffer))
+            if not chunk:
+                continue
+            buffer.extend(chunk)
+        if len(buffer) != count:
+            return None
+        return bytes(buffer)
+
+    def _read_response(self, conn) -> Optional[tuple[int, bytes]]:
+        start = time.monotonic()
+        marker = bytearray()
+        while time.monotonic() - start < self.timeout:
+            b = conn.read(1)
+            if not b:
+                continue
+            marker.extend(b)
+            if marker.endswith(self.HEADER_RESPONSE):
+                break
+        if not marker.endswith(self.HEADER_RESPONSE):
+            return None
+
+        length_raw = self._read_exact(conn, 1, self.timeout)
+        cmd_raw = self._read_exact(conn, 1, self.timeout)
+        if length_raw is None or cmd_raw is None:
+            return None
+        size = length_raw[0]
+        cmd = cmd_raw[0]
+        payload = self._read_exact(conn, size, self.timeout) or b''
+        crc_raw = self._read_exact(conn, 1, self.timeout)
+        if crc_raw is None:
+            return None
+
+        checksum = size ^ cmd
+        for byte in payload:
+            checksum ^= byte
+        if checksum != crc_raw[0]:
+            return None
+        return cmd, payload
+
+    def _parse_payload(self, payload: bytes) -> Optional[Dict[str, float]]:
+        if len(payload) < 18:
+            return None
+        try:
+            _, _, lat_raw, lon_raw, _, speed_raw, course_raw = struct.unpack('<BBiiiHH', payload[:18])
+        except struct.error:
+            return None
+
+        speed_m_s = speed_raw / 100.0
+        return {
+            'lat': lat_raw / 1e7,
+            'lon': lon_raw / 1e7,
+            'ground_speed': speed_m_s * 1.943844,
+            'track': float(course_raw) / 10.0,
+            'heading': float(course_raw) / 10.0,
+        }
+
+    def _worker(self):
+        conn = None
+        try:
+            conn = serial.Serial(self.port, self.baudrate, timeout=0.05)
+            while self._running.is_set():
+                conn.write(self._build_request(self.MSP_GPS))
+                response = self._read_response(conn)
+                if response and response[0] == self.MSP_GPS:
+                    parsed = self._parse_payload(response[1])
+                    if parsed is not None:
+                        if self.data_queue.full():
+                            try:
+                                self.data_queue.get_nowait()
+                            except queue.Empty:
+                                pass
+                        self.data_queue.put(parsed)
+                time.sleep(0.08)
+        except Exception as exc:
+            if self.error_queue.empty():
+                self.error_queue.put(exc)
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    def poll(self, timeout: float = 0.05) -> Optional[Dict[str, float]]:
+        if not self.error_queue.empty():
+            raise RuntimeError(f'Source MSP arretee: {self.error_queue.get()}')
+        try:
+            return self.data_queue.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+
+def build_navigation_source(mode: int):
+    if mode == MODE_MANUAL:
+        print('Mode 1 actif: controle manuel clavier')
+        return None
+
+    if mode == MODE_XPLANE:
+        ip = prompt_text('Adresse IP X-Plane', '127.0.0.1')
+        port = prompt_int('Port UDP X-Plane', 49000)
+        local_port = prompt_int('Port UDP local ecoute', 49005)
+        try:
+            source = XPlaneUDPRealtimeSource(ip=ip, port=port, local_port=local_port)
+            source.start()
+            return source
+        except Exception as exc:
+            print(f'Impossible de demarrer le mode X-Plane: {exc}')
+            print('Demarrage sans source X-Plane.')
+            return None
+
+    port = prompt_text('Port serie MSP', 'COM3')
+    baudrate = prompt_int('Baud rate MSP', 115200)
+    try:
+        source = MSPGPSRealtimeSource(port=port, baudrate=baudrate)
+        source.start()
+        print('Mode 3 actif: donnees GPS MSP temps reel')
+        return source
+    except Exception as exc:
+        print(f'Impossible de demarrer le mode MSP: {exc}')
+        print('Demarrage sans source MSP.')
+        return None
 
 
 class RPMGauge(QWidget):
@@ -933,7 +1319,7 @@ class FuelTank(QWidget):
 
 
 class GPSWidget(QWidget):
-    def __init__(self):
+    def __init__(self, enable_sync=True):
         super().__init__()
         self.setStyleSheet('background-color: #202020;')
         layout = QVBoxLayout()
@@ -941,6 +1327,7 @@ class GPSWidget(QWidget):
         layout.setSpacing(0)
         self.setLayout(layout)
         self.web_view = None
+        self.enable_sync = enable_sync
         self.current_heading = 0
         self.current_track = 0
         if QWebEngineView is None:
@@ -965,7 +1352,7 @@ class GPSWidget(QWidget):
             self._build_placeholder(f'Erreur lors du chargement du GPS : {exc}')
 
     def _on_page_loaded(self, ok):
-        if ok and self.web_view:
+        if ok and self.web_view and self.enable_sync:
             # Injecter un timer pour récupérer les données de l'avion
             self._start_data_sync()
 
@@ -1365,6 +1752,10 @@ class NavigationDisplayWidget(QWidget):
 
         self.com2_standby = '118.500'
 
+        self.source_status = 'SRC MANUAL'
+
+        self.source_color = '#a9b4c6'
+
         self.active_waypoint = WaypointInfo('----', is_active=True)
 
         self.next_waypoints: List[WaypointInfo] = []
@@ -1600,6 +1991,11 @@ class NavigationDisplayWidget(QWidget):
         com2_text = f"COM2  {self.com2_active}  <->  {self.com2_standby}"
         painter.drawText(banner_rect.adjusted(0, 8, -18, -32), ALIGN_RIGHT | ALIGN_VCENTER, com1_text)
         painter.drawText(banner_rect.adjusted(0, 32, -18, -6), ALIGN_RIGHT | ALIGN_VCENTER, com2_text)
+
+        status_font = QFont('Consolas', 9, QFont.Bold)
+        painter.setFont(status_font)
+        painter.setPen(QColor(self.source_color))
+        painter.drawText(banner_rect.adjusted(16, 0, -18, -48), ALIGN_RIGHT | ALIGN_VCENTER, self.source_status)
 
 
     def _draw_range_rings(self, painter, center, radius):
@@ -1995,7 +2391,7 @@ class CapWidget(QWidget):
 
 class EngineDisplay(QWidget):
 
-    def __init__(self):
+    def __init__(self, startup_mode=MODE_XPLANE, data_source=None):
 
         super().__init__()
 
@@ -2006,6 +2402,10 @@ class EngineDisplay(QWidget):
         self.setStyleSheet('background-color: black')
 
         self._local_service_processes = []
+        self.startup_mode = startup_mode
+        self.data_source = data_source
+        self._source_error_reported = False
+        self._last_source_rx_time: Optional[float] = None
 
 
 
@@ -2096,6 +2496,16 @@ class EngineDisplay(QWidget):
 
         self.nav_mode = 'ARC'
 
+        if self.startup_mode == MODE_XPLANE:
+            self.source_status = 'SRC XPLANE CONNECTING'
+            self.source_color = '#ffd166'
+        elif self.startup_mode == MODE_MSP:
+            self.source_status = 'SRC MSP CONNECTING'
+            self.source_color = '#ffd166'
+        else:
+            self.source_status = 'SRC MANUAL'
+            self.source_color = '#a9b4c6'
+
 
 
         main_layout = QHBoxLayout()
@@ -2144,7 +2554,7 @@ class EngineDisplay(QWidget):
 
 
 
-        self.gps = GPSWidget()
+        self.gps = GPSWidget(enable_sync=False)
 
         self.cap_widget = CapWidget()
 
@@ -2263,6 +2673,11 @@ class EngineDisplay(QWidget):
     def closeEvent(self, a0):
 
         self._stop_local_services()
+        if self.data_source and hasattr(self.data_source, 'stop'):
+            try:
+                self.data_source.stop()
+            except Exception:
+                pass
         super().closeEvent(a0)
 
 
@@ -2291,6 +2706,54 @@ class EngineDisplay(QWidget):
 
 
     def update_display(self):
+
+        if self.startup_mode in (MODE_XPLANE, MODE_MSP) and self.data_source is not None:
+            try:
+                data = self.data_source.poll(timeout=0.0)
+                if data:
+                    self._last_source_rx_time = time.monotonic()
+                    self.heading = float(data.get('heading', self.heading)) % 360
+                    self.track = float(data.get('track', self.track)) % 360
+                    self.ground_speed = float(data.get('ground_speed', self.ground_speed))
+                    self.lat = float(data.get('lat', self.lat))
+                    self.lon = float(data.get('lon', self.lon))
+                    self.rpm = int(max(0, min(3000, float(data.get('rpm', self.rpm)))))
+                    self.load = int(max(0, min(100, float(data.get('load', self.load)))))
+                    self.fflow = max(0.0, min(20.0, float(data.get('fflow', self.fflow))))
+                    self.oil_psi = max(0.0, min(100.0, float(data.get('oil_psi', self.oil_psi))) )
+                    self.oil_temp = int(max(50, min(300, float(data.get('oil_temp', self.oil_temp)))))
+                    self.egt = int(max(1000, min(1800, float(data.get('egt', self.egt)))))
+                    self.fuel_qty_L = int(max(0, min(100, float(data.get('fuel_qty_L', self.fuel_qty_L)))))
+                    self.fuel_qty_R = int(max(0, min(100, float(data.get('fuel_qty_R', self.fuel_qty_R)))))
+
+                    if self.startup_mode == MODE_XPLANE:
+                        self.source_status = 'SRC XPLANE UDP OK'
+                        self.source_color = '#69f0ae'
+                    elif self.startup_mode == MODE_MSP:
+                        self.source_status = 'SRC MSP OK'
+                        self.source_color = '#69f0ae'
+            except RuntimeError as exc:
+                if not self._source_error_reported:
+                    print(exc)
+                    self._source_error_reported = True
+                if self.startup_mode == MODE_XPLANE:
+                    self.source_status = 'SRC XPLANE ERROR'
+                    self.source_color = '#ff6b6b'
+                elif self.startup_mode == MODE_MSP:
+                    self.source_status = 'SRC MSP ERROR'
+                    self.source_color = '#ff6b6b'
+                self.data_source = None
+            except Exception:
+                pass
+
+        if self._last_source_rx_time is not None and self.startup_mode in (MODE_XPLANE, MODE_MSP):
+            age = time.monotonic() - self._last_source_rx_time
+            if age > 1.0:
+                if self.startup_mode == MODE_XPLANE:
+                    self.source_status = f'SRC XPLANE STALE {age:0.1f}s'
+                else:
+                    self.source_status = f'SRC MSP STALE {age:0.1f}s'
+                self.source_color = '#ffd166'
 
         self.rpm_widget.setValue(self.rpm)
 
@@ -2341,6 +2804,10 @@ class EngineDisplay(QWidget):
             'com2_active': self.com2_active,
 
             'com2_standby': self.com2_standby,
+
+            'source_status': self.source_status,
+
+            'source_color': self.source_color,
 
             'distance_to_active': self.distance_to_waypoint,
 
@@ -2520,9 +2987,12 @@ class EngineDisplay(QWidget):
 
 def main():
 
+    mode = choose_mode()
+    data_source = build_navigation_source(mode)
+
     app = QApplication(sys.argv)
 
-    window = EngineDisplay()
+    window = EngineDisplay(startup_mode=mode, data_source=data_source)
 
     window.show()
 

@@ -5,10 +5,7 @@ import socket
 import subprocess
 import struct
 import sys
-<<<<<<< HEAD
 import threading
-=======
->>>>>>> 11ab52ceb4399aaf6e77c1c6a436e8d08fe12d6d
 import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, cast
@@ -75,24 +72,6 @@ KEY_L = getattr(Qt, 'Key_L', getattr(getattr(Qt, 'Key', Qt), 'Key_L'))
 KEY_PAGE_UP = getattr(Qt, 'Key_PageUp', getattr(getattr(Qt, 'Key', Qt), 'Key_PageUp'))
 KEY_PAGE_DOWN = getattr(Qt, 'Key_PageDown', getattr(getattr(Qt, 'Key', Qt), 'Key_PageDown'))
 KEY_M = getattr(Qt, 'Key_M', getattr(getattr(Qt, 'Key', Qt), 'Key_M'))
-KEY_N = getattr(Qt, 'Key_N', getattr(getattr(Qt, 'Key', Qt), 'Key_N'))
-
-
-MODE_JOYSTICK = 1
-MODE_XPLANE = 2
-MODE_MSP = 3
-
-MODE_MANUAL = MODE_JOYSTICK
-MODE_CRUISE = MODE_XPLANE
-MODE_STRESS = MODE_MSP
-
-
-def _clamp(value, min_value, max_value):
-    return max(min_value, min(max_value, value))
-
-
-def _normalize_heading(value):
-    return value % 360
 
 MODE_MANUAL = 1
 MODE_XPLANE = 2
@@ -108,7 +87,6 @@ class WaypointInfo:
     is_active: bool = False
 
 
-<<<<<<< HEAD
 def prompt_text(label: str, default: Optional[str] = None) -> str:
     suffix = f" [{default}]" if default is not None else ''
     value = input(f"{label}{suffix}: ").strip()
@@ -479,130 +457,6 @@ def build_navigation_source(mode: int):
         print(f'Impossible de demarrer le mode MSP: {exc}')
         print('Demarrage sans source MSP.')
         return None
-=======
-@dataclass
-class EngineTelemetry:
-    rpm: float = 0.0
-    load: float = 0.0
-    fflow: float = 0.0
-    oil_psi: float = 0.0
-    oil_temp: float = 50.0
-    egt: float = 1000.0
-    fuel_temp_left: float = -40.0
-    fuel_temp_right: float = -40.0
-    fuel_qty_L: float = 0.0
-    fuel_qty_R: float = 0.0
-    heading: float = 0.0
-    track: float = 0.0
-    ground_speed: float = 0.0
-    true_airspeed: float = 0.0
-    lat: float = 38.0
-    lon: float = 25.0
-
-    def as_dict(self):
-        return {
-            'rpm': self.rpm,
-            'load': self.load,
-            'fflow': self.fflow,
-            'oil_psi': self.oil_psi,
-            'oil_temp': self.oil_temp,
-            'egt': self.egt,
-            'fuel_temp_left': self.fuel_temp_left,
-            'fuel_temp_right': self.fuel_temp_right,
-            'fuel_qty_L': self.fuel_qty_L,
-            'fuel_qty_R': self.fuel_qty_R,
-            'heading': self.heading,
-            'track': self.track,
-            'ground_speed': self.ground_speed,
-            'true_airspeed': self.true_airspeed,
-            'lat': self.lat,
-            'lon': self.lon,
-        }
-
-
-class ManualEngineSource:
-
-    def __init__(self, display):
-        self.display = display
-
-    def poll(self):
-        return EngineTelemetry(
-            rpm=self.display.rpm,
-            load=self.display.load,
-            fflow=self.display.fflow,
-            oil_psi=self.display.oil_psi,
-            oil_temp=self.display.oil_temp,
-            egt=self.display.egt,
-            fuel_temp_left=self.display.fuel_temp_left,
-            fuel_temp_right=self.display.fuel_temp_right,
-            fuel_qty_L=self.display.fuel_qty_L,
-            fuel_qty_R=self.display.fuel_qty_R,
-            heading=self.display.heading,
-            track=self.display.track,
-            ground_speed=self.display.ground_speed,
-            true_airspeed=self.display.true_airspeed,
-            lat=self.display.lat,
-            lon=self.display.lon,
-        ).as_dict()
-
-
-class CruiseEngineSource:
-
-    def __init__(self):
-        self.t0 = time.monotonic()
-
-    def poll(self):
-        t = time.monotonic() - self.t0
-        heading = _normalize_heading(110.0 + 35.0 * math.sin(t * 0.10))
-        track = _normalize_heading(heading + 3.0 * math.sin(t * 0.17))
-        return EngineTelemetry(
-            rpm=2100.0 + 180.0 * math.sin(t * 0.20),
-            load=62.0 + 10.0 * math.sin(t * 0.27),
-            fflow=8.8 + 0.7 * math.sin(t * 0.23),
-            oil_psi=58.0 + 6.0 * math.sin(t * 0.21),
-            oil_temp=190.0 + 12.0 * math.sin(t * 0.18),
-            egt=1310.0 + 40.0 * math.sin(t * 0.24),
-            fuel_temp_left=58.0 + 4.0 * math.sin(t * 0.14),
-            fuel_temp_right=60.0 + 4.5 * math.sin(t * 0.16),
-            fuel_qty_L=58.0 + 6.0 * math.sin(t * 0.03),
-            fuel_qty_R=54.0 + 5.0 * math.sin(t * 0.032),
-            heading=heading,
-            track=track,
-            ground_speed=142.0 + 6.0 * math.sin(t * 0.15),
-            true_airspeed=138.0 + 5.0 * math.sin(t * 0.13),
-            lat=38.0 + 0.08 * math.sin(t * 0.01),
-            lon=25.0 + 0.10 * math.cos(t * 0.01),
-        ).as_dict()
-
-
-class StressEngineSource:
-
-    def __init__(self):
-        self.t0 = time.monotonic()
-
-    def poll(self):
-        t = time.monotonic() - self.t0
-        heading = _normalize_heading(240.0 + 90.0 * math.sin(t * 0.22))
-        track = _normalize_heading(heading - 10.0 + 8.0 * math.sin(t * 0.41))
-        return EngineTelemetry(
-            rpm=2680.0 + 240.0 * math.sin(t * 0.65),
-            load=84.0 + 12.0 * math.sin(t * 0.55),
-            fflow=14.5 + 2.2 * math.sin(t * 0.48),
-            oil_psi=26.0 + 10.0 * math.sin(t * 0.92),
-            oil_temp=255.0 + 20.0 * math.sin(t * 0.60),
-            egt=1580.0 + 120.0 * math.sin(t * 0.72),
-            fuel_temp_left=112.0 + 18.0 * math.sin(t * 0.53),
-            fuel_temp_right=116.0 + 20.0 * math.sin(t * 0.59),
-            fuel_qty_L=22.0 + 8.0 * math.sin(t * 0.08),
-            fuel_qty_R=18.0 + 7.0 * math.sin(t * 0.09),
-            heading=heading,
-            track=track,
-            ground_speed=171.0 + 13.0 * math.sin(t * 0.37),
-            true_airspeed=167.0 + 12.0 * math.sin(t * 0.33),
-            lat=38.0 + 0.22 * math.sin(t * 0.03),
-            lon=25.0 + 0.24 * math.cos(t * 0.03),
-        ).as_dict()
->>>>>>> 11ab52ceb4399aaf6e77c1c6a436e8d08fe12d6d
 
 
 class RPMGauge(QWidget):
@@ -2641,46 +2495,6 @@ class EngineDisplay(QWidget):
         ]
 
         self.nav_mode = 'ARC'
-        self.engine_mode = MODE_MANUAL
-        self.engine_mode_names = {
-            MODE_MANUAL: 'MODE 1 - MANUAL',
-            MODE_CRUISE: 'MODE 2 - CRUISE',
-            MODE_STRESS: 'MODE 3 - STRESS',
-        }
-        self.engine_sources = {
-            MODE_MANUAL: ManualEngineSource(self),
-            MODE_CRUISE: CruiseEngineSource(),
-            MODE_STRESS: StressEngineSource(),
-        }
-        self.engine_source = self.engine_sources[self.engine_mode]
-        self.engine_control_keys = {
-            KEY_UP,
-            KEY_DOWN,
-            KEY_RIGHT,
-            KEY_LEFT,
-            KEY_W,
-            KEY_S,
-            KEY_E,
-            KEY_D,
-            KEY_R,
-            KEY_F,
-            KEY_T,
-            KEY_G,
-            KEY_Y,
-            KEY_H,
-            KEY_I,
-            KEY_K,
-            KEY_Z,
-            KEY_X,
-            KEY_C,
-            KEY_V,
-            KEY_U,
-            KEY_J,
-            KEY_O,
-            KEY_L,
-            KEY_PAGE_UP,
-            KEY_PAGE_DOWN,
-        }
 
         if self.startup_mode == MODE_XPLANE:
             self.source_status = 'SRC XPLANE CONNECTING'
@@ -2724,12 +2538,6 @@ class EngineDisplay(QWidget):
 
         self.fuel_qty_gal_widget = FuelQuantityGauge()
 
-        self.mode_label = QLabel('')
-
-        self.mode_label.setAlignment(ALIGN_CENTER)
-
-        self.mode_label.setStyleSheet('color: #7cfaff; font: bold 12px Consolas;')
-
         left_col.addWidget(self.fflow_widget)
 
         left_col.addWidget(self.oil_psi_widget)
@@ -2741,8 +2549,6 @@ class EngineDisplay(QWidget):
         left_col.addWidget(self.fuel_temp_widget)
 
         left_col.addWidget(self.fuel_qty_gal_widget)
-
-        left_col.addWidget(self.mode_label)
 
         left_col.addStretch()
 
@@ -2800,8 +2606,6 @@ class EngineDisplay(QWidget):
         self.timer.timeout.connect(self.update_display)
 
         self.timer.start(100)
-
-        self._set_engine_mode(self.engine_mode)
 
         self._start_local_services()
 
@@ -2877,54 +2681,6 @@ class EngineDisplay(QWidget):
         super().closeEvent(a0)
 
 
-    def _set_engine_mode(self, mode):
-
-        if mode not in self.engine_sources:
-            return
-
-        self.engine_mode = mode
-        self.engine_source = self.engine_sources[mode]
-        mode_name = self.engine_mode_names.get(mode, f'MODE {mode}')
-        self.mode_label.setText(f'{mode_name}  (N: cycle)')
-        self.setWindowTitle(f'DA40 Engine Display (PyQt5) - {mode_name}')
-
-
-    def _cycle_engine_mode(self):
-
-        order = [MODE_MANUAL, MODE_CRUISE, MODE_STRESS]
-        try:
-            idx = order.index(self.engine_mode)
-        except ValueError:
-            idx = 0
-        self._set_engine_mode(order[(idx + 1) % len(order)])
-
-
-    def _apply_engine_mode(self):
-
-        if self.engine_source is None:
-            return
-        data = self.engine_source.poll()
-        if not data:
-            return
-        self.rpm = _clamp(float(data.get('rpm', self.rpm)), 0, 3000)
-        self.load = _clamp(float(data.get('load', self.load)), 0, 100)
-        self.fflow = _clamp(float(data.get('fflow', self.fflow)), 0.0, 20.0)
-        self.oil_psi = _clamp(float(data.get('oil_psi', self.oil_psi)), 0.0, 100.0)
-        self.oil_temp = _clamp(float(data.get('oil_temp', self.oil_temp)), 50.0, 300.0)
-        self.egt = _clamp(float(data.get('egt', self.egt)), 1000.0, 1800.0)
-        self.fuel_temp_left = _clamp(float(data.get('fuel_temp_left', self.fuel_temp_left)), -40.0, 160.0)
-        self.fuel_temp_right = _clamp(float(data.get('fuel_temp_right', self.fuel_temp_right)), -40.0, 160.0)
-        self.fuel_qty_L = _clamp(float(data.get('fuel_qty_L', self.fuel_qty_L)), 0.0, 100.0)
-        self.fuel_qty_R = _clamp(float(data.get('fuel_qty_R', self.fuel_qty_R)), 0.0, 100.0)
-        self.heading = _normalize_heading(float(data.get('heading', self.heading)))
-        self.track = _normalize_heading(float(data.get('track', self.track)))
-        self.ground_speed = _clamp(float(data.get('ground_speed', self.ground_speed)), 0.0, 300.0)
-        self.true_airspeed = _clamp(float(data.get('true_airspeed', self.true_airspeed)), 0.0, 300.0)
-        self.lat = _clamp(float(data.get('lat', self.lat)), -90.0, 90.0)
-        lon = float(data.get('lon', self.lon))
-        self.lon = ((lon + 180.0) % 360.0) - 180.0
-
-
 
     def update_from_gps(self, heading, track, lat=None, lon=None):
 
@@ -2951,7 +2707,6 @@ class EngineDisplay(QWidget):
 
     def update_display(self):
 
-<<<<<<< HEAD
         if self.startup_mode in (MODE_XPLANE, MODE_MSP) and self.data_source is not None:
             try:
                 data = self.data_source.poll(timeout=0.0)
@@ -2999,9 +2754,6 @@ class EngineDisplay(QWidget):
                 else:
                     self.source_status = f'SRC MSP STALE {age:0.1f}s'
                 self.source_color = '#ffd166'
-=======
-        self._apply_engine_mode()
->>>>>>> 11ab52ceb4399aaf6e77c1c6a436e8d08fe12d6d
 
         self.rpm_widget.setValue(self.rpm)
 
@@ -3108,20 +2860,6 @@ class EngineDisplay(QWidget):
             return
 
         key = a0.key()
-
-        if key == KEY_N:
-
-            self._cycle_engine_mode()
-
-            self.update_display()
-
-            return
-
-        if self.engine_mode != MODE_MANUAL and key in self.engine_control_keys:
-
-            a0.accept()
-
-            return
 
         if key == KEY_UP:
 

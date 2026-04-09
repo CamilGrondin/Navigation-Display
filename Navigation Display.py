@@ -1,4 +1,5 @@
 import math
+import gzip
 import os
 import queue
 import socket
@@ -7,6 +8,7 @@ import struct
 import sys
 import threading
 import time
+import webbrowser
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, cast
 
@@ -25,9 +27,31 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
+
+def _append_chromium_flag(flag):
+    current = os.environ.get('QTWEBENGINE_CHROMIUM_FLAGS', '').strip()
+    if flag in current.split():
+        return
+    os.environ['QTWEBENGINE_CHROMIUM_FLAGS'] = f'{current} {flag}'.strip()
+
+
+def _configure_qtwebengine_runtime():
+    if sys.platform != 'darwin':
+        return
+    setting = os.environ.get('NAVIGATION_DISPLAY_QTWEBENGINE_JITLESS', '1').strip().lower()
+    if setting in ('0', 'false', 'no'):
+        return
+    # tar1090 can crash the embedded V8 renderer on some macOS QtWebEngine builds.
+    _append_chromium_flag('--js-flags=--jitless')
+
+
+_configure_qtwebengine_runtime()
+
 try:
-    from PyQt5.QtWebEngineWidgets import QWebEngineView
+    from PyQt5.QtWebEngineWidgets import QWebEnginePage, QWebEngineSettings, QWebEngineView
 except ImportError:  # pragma: no cover - optional dependency
+    QWebEnginePage = None
+    QWebEngineSettings = None
     QWebEngineView = None
 
 try:
@@ -45,6 +69,7 @@ STRONG_FOCUS = getattr(Qt, 'StrongFocus', getattr(getattr(Qt, 'FocusPolicy', Qt)
 NO_CONTEXT_MENU = getattr(Qt, 'NoContextMenu', getattr(getattr(Qt, 'ContextMenuPolicy', Qt), 'NoContextMenu'))
 VERTICAL_ORIENTATION = getattr(Qt, 'Vertical', getattr(getattr(Qt, 'Orientation', Qt), 'Vertical'))
 FLAT_CAP_STYLE = getattr(Qt, 'FlatCap', getattr(getattr(Qt, 'PenCapStyle', Qt), 'FlatCap'))
+POINTING_HAND_CURSOR = getattr(Qt, 'PointingHandCursor', getattr(getattr(Qt, 'CursorShape', Qt), 'PointingHandCursor'))
 
 KEY_UP = getattr(Qt, 'Key_Up', getattr(getattr(Qt, 'Key', Qt), 'Key_Up'))
 KEY_DOWN = getattr(Qt, 'Key_Down', getattr(getattr(Qt, 'Key', Qt), 'Key_Down'))
@@ -1659,7 +1684,8 @@ class GreeceMapWidget(QWidget):
 class Tar1090Widget(QWidget):
     """Widget affichant la carte tar1090 (ADS-B) servie localement."""
 
-    TAR1090_URL = 'http://localhost:8081'
+    TAR1090_URL = 'http://127.0.0.1:8081/?noglobe'
+    TAR1090_URL_SAFE = 'http://127.0.0.1:8081/?noglobe&pTracks'
 
     def __init__(self):
         super().__init__()
@@ -1669,17 +1695,30 @@ class Tar1090Widget(QWidget):
         layout.setSpacing(0)
         self.setLayout(layout)
         self.web_view = None
+        self._initial_load_pending = True
+        self._load_retry_count = 0
+        self._max_load_retries = 8
+        self._render_crash_count = 0
+        self._max_render_crashes = 2
+        self._safe_mode_enabled = False
+        self._stability_timer = QTimer(self)
+        self._stability_timer.setSingleShot(True)
+        self._stability_timer.timeout.connect(self._reset_render_crash_counter)
+        self._reload_timer = QTimer(self)
+        self._reload_timer.setSingleShot(True)
+        self._reload_timer.timeout.connect(self.reload_page)
 
-        if os.environ.get('NAVIGATION_DISPLAY_AUTOSTART_ADSB', '').strip() != '1':
+        autostart_setting = os.environ.get('NAVIGATION_DISPLAY_AUTOSTART_ADSB', '1').strip().lower()
+        if autostart_setting in ('0', 'false', 'no'):
             self._build_placeholder(
                 'Les services ADS-B ne sont pas démarrés automatiquement.\n\n'
                 'Pour activer tar1090, lancez readsb et le serveur HTTP manuellement, '
-                'ou définissez NAVIGATION_DISPLAY_AUTOSTART_ADSB=1 avant de démarrer '
+                'ou supprimez NAVIGATION_DISPLAY_AUTOSTART_ADSB=0 (ou false/no) avant de démarrer '
                 'l’application.'
             )
             return
 
-        if QWebEngineView is None:
+        if QWebEngineView is None or QWebEngineSettings is None or QWebEnginePage is None:
             self._build_placeholder(
                 'PyQtWebEngine est requis pour afficher la carte tar1090.\n'
                 'Installez pyqtwebengine.'
@@ -1690,101 +1729,169 @@ class Tar1090Widget(QWidget):
             self.web_view = QWebEngineView()
             self.web_view.setContextMenuPolicy(NO_CONTEXT_MENU)
             layout.addWidget(self.web_view)
-            self.web_view.load(QUrl(self.TAR1090_URL))
+            
+            # Configure WebEngine explicitly for complex map rendering in tar1090
+            settings = self.web_view.settings()
+            settings.setAttribute(QWebEngineSettings.WebGLEnabled, True)
+            settings.setAttribute(QWebEngineSettings.LocalContentCanAccessRemoteUrls, True)
+            settings.setAttribute(QWebEngineSettings.LocalContentCanAccessFileUrls, True)
+            settings.setAttribute(QWebEngineSettings.AllowRunningInsecureContent, True)
+            settings.setAttribute(QWebEngineSettings.JavascriptEnabled, True)
+            settings.setAttribute(QWebEngineSettings.LocalStorageEnabled, True)
+            
+            class WebPage(QWebEnginePage):
+                def javaScriptConsoleMessage(self, level, message, lineNumber, sourceID):
+                    # Use numeric levels for compatibility across PyQt5 variants.
+                    prefix = {0: "js [INFO]:", 1: "js [WARN]:", 2: "js [ERROR]:"}.get(int(level), "js:")
+                    print(f"{prefix} {message} (Line: {lineNumber} in {sourceID})")
+
+            current_page = self.web_view.page()
+            profile = current_page.profile() if current_page is not None else None
+            if profile is not None:
+                self.web_page = WebPage(profile, self.web_view)
+            else:
+                self.web_page = WebPage(self.web_view)
+            self.web_view.setPage(self.web_page)
+
+            if hasattr(self.web_view, 'renderProcessTerminated'):
+                self.web_view.renderProcessTerminated.connect(self._on_render_process_terminated)
+
+            # Load lazily when the tab is visible; loading while hidden can leave map size at 0x0.
+            self.web_view.loadFinished.connect(self._on_load_finished)
+            
         except Exception as exc:
             self.web_view = None
             self._build_placeholder(f'Erreur lors du chargement de tar1090 : {exc}')
 
-    def reload_page(self):
-        if self.web_view:
-            self.web_view.reload()
+    def ensure_loaded(self):
+        if not self.web_view:
+            return
+        if self._initial_load_pending:
+            self._initial_load_pending = False
+            self._load_retry_count = 0
+            self.web_view.load(QUrl(self._target_url()))
+            return
+        self._nudge_map_render()
 
-    def _build_placeholder(self, message):
-        layout = self.layout()
-        if layout is None:
-            layout = QVBoxLayout(self)
-            layout.setContentsMargins(0, 0, 0, 0)
-            layout.setSpacing(0)
-        while layout.count():
-            item = layout.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                widget.deleteLater()
-        layout.setContentsMargins(40, 40, 40, 40)
-        layout.setSpacing(12)
-        title = QLabel('TAR1090 – ADS-B')
-        title.setAlignment(ALIGN_CENTER)
-        title.setStyleSheet('color: #7cfaff; font: bold 20px Arial;')
-        content = QLabel(message)
-        content.setWordWrap(True)
-        content.setAlignment(ALIGN_CENTER)
-        content.setStyleSheet('color: white; font: 14px Arial;')
-        hint = QLabel(
-            'Lancez les commandes suivantes dans un terminal :\n\n'
-            'readsb --net --device-type rtlsdr --gain auto '
-            '--write-json-every 0.5 --write-json ~/tar1090/html/data\n\n'
-            'cd ~/tar1090/html && python3 -m http.server 8081\n\n'
-            "Si readsb affiche usb_claim_interface error -3, arrêtez toute autre instance "
-            'ou détachez le pilote kernel dvb_usb_rtl28xxu.\n\n'
-            'Astuce: NAVIGATION_DISPLAY_AUTOSTART_ADSB=1 réactive le démarrage '
-            'automatique.'
+    def _target_url(self):
+        return self.TAR1090_URL_SAFE if self._safe_mode_enabled else self.TAR1090_URL
+
+    def _enable_safe_mode(self):
+        if self._safe_mode_enabled or not self.web_view:
+            return
+        self._safe_mode_enabled = True
+        settings = self.web_view.settings()
+        if settings is None:
+            return
+        try:
+            settings.setAttribute(QWebEngineSettings.WebGLEnabled, False)
+        except Exception:
+            pass
+        accelerated_canvas_attr = getattr(QWebEngineSettings, 'Accelerated2dCanvasEnabled', None)
+        if accelerated_canvas_attr is not None:
+            try:
+                settings.setAttribute(accelerated_canvas_attr, False)
+            except Exception:
+                pass
+
+    def _nudge_map_render(self):
+        if not self.web_view:
+            return
+        page = self.web_view.page()
+        if page is None:
+            return
+        fix_render_js = """
+        setTimeout(function() {
+            if (typeof map !== 'undefined' && map) {
+                map.updateSize();
+            }
+            window.dispatchEvent(new Event('resize'));
+            document.body.style.backgroundColor = '#1a1d24';
+        }, 120);
+        """
+        page.runJavaScript(fix_render_js)
+
+    def _schedule_reload(self, delay_ms):
+        if not self.web_view:
+            return
+        if self._reload_timer.isActive():
+            return
+        self._reload_timer.start(max(80, int(delay_ms)))
+
+    def _reset_render_crash_counter(self):
+        if self._render_crash_count:
+            print('Tar1090: rendu stabilise, compteur de crash remis a zero.')
+        self._render_crash_count = 0
+
+    def _on_load_finished(self, ok):
+        if not ok:
+            # Connection can fail briefly if the local HTTP service is still starting.
+            if self.web_view and self._load_retry_count < self._max_load_retries:
+                self._load_retry_count += 1
+                retry_ms = min(2200, 350 * self._load_retry_count)
+                self._schedule_reload(retry_ms)
+                return
+            if not self._safe_mode_enabled:
+                print('Tar1090: activation du mode de compatibilite (sans WebGL).')
+                self._enable_safe_mode()
+                self._load_retry_count = 0
+                self._schedule_reload(220)
+                return
+            self._build_placeholder(
+                'Impossible de charger la carte ADS-B apres plusieurs tentatives.\n\n'
+                'Verifiez que readsb et le serveur HTTP local sont demarres puis reessayez.',
+                open_url=self._target_url(),
+            )
+            return
+
+        self._load_retry_count = 0
+        # Keep crash count until rendering remains stable for a short period.
+        self._stability_timer.start(7000)
+
+        # Multiple nudges handle delayed layout computation in embedded tabs.
+        QTimer.singleShot(120, self._nudge_map_render)
+        QTimer.singleShot(1200, self._nudge_map_render)
+
+    def _on_render_process_terminated(self, termination_status, exit_code):
+        status_value = int(termination_status) if termination_status is not None else -1
+        self._stability_timer.stop()
+        self._render_crash_count += 1
+        print(
+            f'Tar1090: moteur Web termine (status={status_value}, exit={exit_code}), '
+            f'tentative {self._render_crash_count}.'
         )
-        hint.setWordWrap(True)
-        hint.setAlignment(ALIGN_CENTER)
-        hint.setStyleSheet('color: #aaa; font: 12px monospace;')
-        layout.addStretch()
-        layout.addWidget(title)
-        layout.addSpacing(12)
-        layout.addWidget(content)
-        layout.addSpacing(8)
-        layout.addWidget(hint)
-        layout.addStretch()
 
+        if self._render_crash_count == 1:
+            self._enable_safe_mode()
 
-class Tar1090Widget(QWidget):
-    """Widget affichant la carte tar1090 (ADS-B) servie localement."""
-
-    TAR1090_URL = 'http://localhost:8081'
-
-    def __init__(self):
-        super().__init__()
-        self.setStyleSheet('background-color: #1a1d24;')
-        layout = QVBoxLayout()
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
-        self.setLayout(layout)
-        self.web_view = None
-
-        if os.environ.get('NAVIGATION_DISPLAY_AUTOSTART_ADSB', '').strip() != '1':
-            self._build_placeholder(
-                'Les services ADS-B ne sont pas démarrés automatiquement.\n\n'
-                'Pour activer tar1090, lancez readsb et le serveur HTTP manuellement, '
-                'ou définissez NAVIGATION_DISPLAY_AUTOSTART_ADSB=1 avant de démarrer '
-                'l’application.'
-            )
+        if self.web_view and self._render_crash_count <= self._max_render_crashes:
+            self._load_retry_count = 0
+            self._schedule_reload(420)
             return
 
-        if QWebEngineView is None:
-            self._build_placeholder(
-                'PyQtWebEngine est requis pour afficher la carte tar1090.\n'
-                'Installez pyqtwebengine.'
-            )
-            return
-
-        try:
-            self.web_view = QWebEngineView()
-            self.web_view.setContextMenuPolicy(NO_CONTEXT_MENU)
-            layout.addWidget(self.web_view)
-            self.web_view.load(QUrl(self.TAR1090_URL))
-        except Exception as exc:
-            self.web_view = None
-            self._build_placeholder(f'Erreur lors du chargement de tar1090 : {exc}')
+        self._build_placeholder(
+            'Le moteur de rendu ADS-B a cesse de repondre.\n\n'
+            'Le service ADS-B est actif, mais QtWebEngine plante sur cette page.\n'
+            'Ouvrez tar1090 dans le navigateur avec le bouton ci-dessous.',
+            open_url=self._target_url(),
+        )
 
     def reload_page(self):
         if self.web_view:
-            self.web_view.reload()
+            if self._initial_load_pending:
+                self.ensure_loaded()
+            else:
+                self.web_view.load(QUrl(self._target_url()))
 
-    def _build_placeholder(self, message):
+    def _open_external_url(self, url):
+        try:
+            webbrowser.open(url)
+        except Exception as exc:
+            print(f'Impossible d ouvrir le navigateur: {exc}')
+
+    def _build_placeholder(self, message, open_url=None):
+        self._stability_timer.stop()
+        self._reload_timer.stop()
         layout = self.layout()
         if layout is None:
             layout = QVBoxLayout(self)
@@ -1795,6 +1902,7 @@ class Tar1090Widget(QWidget):
             widget = item.widget()
             if widget is not None:
                 widget.deleteLater()
+        self.web_view = None
         layout.setContentsMargins(40, 40, 40, 40)
         layout.setSpacing(12)
         title = QLabel('TAR1090 \u2013 ADS-B')
@@ -1817,10 +1925,26 @@ class Tar1090Widget(QWidget):
         hint.setWordWrap(True)
         hint.setAlignment(ALIGN_CENTER)
         hint.setStyleSheet('color: #aaa; font: 12px monospace;')
+
+        open_button = None
+        if open_url:
+            open_button = QPushButton('Ouvrir tar1090 dans le navigateur')
+            open_button.setCursor(POINTING_HAND_CURSOR)
+            open_button.setStyleSheet(
+                'QPushButton { background: #0b7285; color: white; border: none; '
+                'padding: 10px 16px; border-radius: 6px; font: bold 13px Arial; } '
+                'QPushButton:hover { background: #1098ad; }'
+            )
+            open_button.clicked.connect(
+                lambda _checked=False, target=open_url: self._open_external_url(target)
+            )
+
         layout.addStretch()
         layout.addWidget(title)
         layout.addSpacing(12)
         layout.addWidget(content)
+        if open_button is not None:
+            layout.addWidget(open_button, 0, ALIGN_CENTER)
         layout.addSpacing(8)
         layout.addWidget(hint)
         layout.addStretch()
@@ -2723,6 +2847,9 @@ class EngineDisplay(QWidget):
 
         self.greece_widget = GreeceMapWidget()
 
+        # Start local ADS-B services before creating the embedded radar web view.
+        self._start_local_services()
+
         self.tar1090_widget = Tar1090Widget()
 
         for widget in (self.gps, self.cap_widget, self.greece_widget, self.tar1090_widget):
@@ -2740,6 +2867,7 @@ class EngineDisplay(QWidget):
         self.display_tabs.addTab(self.tar1090_widget, 'ADS-B Radar')
 
         self.display_tabs.setCurrentWidget(self.cap_widget)
+        self.display_tabs.currentChanged.connect(self._on_display_tab_changed)
         self.display_tabs.setStyleSheet(
             'QTabWidget::pane { border: 1px solid #5b636f; background: #0a0e15; }'
             'QTabBar::tab { background: #1a1f26; color: #c5cedb; padding: 6px 12px; border: 1px solid #4f5763; }'
@@ -2842,8 +2970,6 @@ class EngineDisplay(QWidget):
         self.timer.timeout.connect(self.update_display)
 
         self.timer.start(100)
-
-        self._start_local_services()
 
         self.update_display()
 
@@ -3007,15 +3133,77 @@ class EngineDisplay(QWidget):
     def _action_tab_greece(self):
         self.display_tabs.setCurrentWidget(self.greece_widget)
 
+    def _ensure_adsb_backend_running(self):
+        if not self._is_http_service_healthy('127.0.0.1', 8081):
+            self._start_local_services()
+
     def _action_tab_adsb(self):
+        self._ensure_adsb_backend_running()
         self.display_tabs.setCurrentWidget(self.tar1090_widget)
+        self.tar1090_widget.ensure_loaded()
+
+    def _on_display_tab_changed(self, index):
+        if self.display_tabs.widget(index) is self.tar1090_widget:
+            self._ensure_adsb_backend_running()
+            self.tar1090_widget.ensure_loaded()
+
+    def _is_http_service_healthy(self, host='127.0.0.1', port=8081) -> bool:
+        try:
+            with socket.create_connection((host, int(port)), timeout=0.6) as conn:
+                conn.settimeout(0.8)
+                conn.sendall(b'GET / HTTP/1.0\r\nHost: localhost\r\n\r\n')
+                response_head = conn.recv(64)
+                return response_head.startswith(b'HTTP/')
+        except Exception:
+            return False
+
+    def _restart_stale_http_server(self, port=8081):
+        port = int(port)
+        # Old detached instances can keep the port but answer with empty replies.
+        subprocess.run(
+            ['pkill', '-f', f'http.server {port}'],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        time.sleep(0.2)
+
+    def _repair_tar1090_db_assets(self, http_dir):
+        db_dir = os.path.join(http_dir, 'db2')
+        if not os.path.isdir(db_dir):
+            return
+
+        repaired = 0
+        try:
+            entries = list(os.scandir(db_dir))
+        except Exception:
+            return
+
+        for entry in entries:
+            if not entry.is_file() or not entry.name.endswith('.js'):
+                continue
+            try:
+                with open(entry.path, 'rb') as handle:
+                    raw = handle.read()
+                if len(raw) < 2 or raw[:2] != b'\x1f\x8b':
+                    continue
+                decoded = gzip.decompress(raw)
+                with open(entry.path, 'wb') as handle:
+                    handle.write(decoded)
+                repaired += 1
+            except Exception:
+                continue
+
+        if repaired:
+            print(f'Reparation tar1090: {repaired} fichier(s) db2 decompresse(s).')
 
 
     def _start_local_services(self):
 
-        if os.environ.get('NAVIGATION_DISPLAY_AUTOSTART_ADSB', '').strip() != '1':
-            print('Démarrage ADS-B automatique désactivé. Définissez NAVIGATION_DISPLAY_AUTOSTART_ADSB=1 '
-                  'pour lancer readsb et le serveur HTTP au démarrage.')
+        autostart_setting = os.environ.get('NAVIGATION_DISPLAY_AUTOSTART_ADSB', '1').strip().lower()
+        if autostart_setting in ('0', 'false', 'no'):
+            print('Démarrage ADS-B automatique désactivé via NAVIGATION_DISPLAY_AUTOSTART_ADSB. '
+                  'Supprimez la variable (ou mettez 1) pour lancer readsb et le serveur HTTP au démarrage.')
             return
 
         data_dir = os.path.expanduser('~/tar1090/html/data')
@@ -3027,32 +3215,64 @@ class EngineDisplay(QWidget):
         except Exception:
             pass
 
-        commands = [
-            (
-                [
-                    'readsb',
-                    '--net',
-                    '--device-type',
-                    'rtlsdr',
-                    '--gain',
-                    'auto',
-                    '--write-json-every',
-                    '0.5',
-                    '--write-json',
-                    data_dir,
-                ],
-                None,
-            ),
-            ([sys.executable, '-m', 'http.server', '8081'], http_dir),
-        ]
+        self._repair_tar1090_db_assets(http_dir)
+
+        readsb_running = subprocess.run(
+            ['pgrep', '-x', 'readsb'],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        ).returncode == 0
+        port_open = False
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                probe.settimeout(0.2)
+                port_open = probe.connect_ex(('127.0.0.1', 8081)) == 0
+        except Exception:
+            port_open = False
+
+        http_running = self._is_http_service_healthy('127.0.0.1', 8081)
+        if port_open and not http_running:
+            print('Port 8081 répond, mais le service HTTP semble invalide (réponse vide/incomplète).')
+            print('Tentative de redémarrage d\'une ancienne instance python -m http.server 8081.')
+            self._restart_stale_http_server(8081)
+            http_running = self._is_http_service_healthy('127.0.0.1', 8081)
+
+        commands = []
+        if not readsb_running:
+            commands.append(
+                (
+                    [
+                        'readsb',
+                        '--net',
+                        '--device-type',
+                        'rtlsdr',
+                        '--gain',
+                        'auto',
+                        '--write-json-every',
+                        '0.5',
+                        '--write-json',
+                        data_dir,
+                    ],
+                    None,
+                )
+            )
+        else:
+            print('readsb déjà actif, démarrage ignoré.')
+
+        if not http_running:
+            commands.append(([sys.executable, '-m', 'http.server', '8081'], http_dir))
+        else:
+            print('Serveur HTTP port 8081 déjà actif, démarrage ignoré.')
 
         for command, working_directory in commands:
             try:
                 process = subprocess.Popen(
                     command,
                     cwd=working_directory,
-                    stdout=None,
-                    stderr=None,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
                     start_new_session=True,
                 )
             except FileNotFoundError:
@@ -3084,7 +3304,11 @@ class EngineDisplay(QWidget):
             if return_code not in (None, 0):
                 print(f'{label} a quitté immédiatement avec le code {return_code}.')
                 print(failure_hint)
-                self._stop_local_services()
+                # Keep other local services (like HTTP) alive even if readsb fails to start.
+                try:
+                    self._local_service_processes = [p for p in self._local_service_processes if p is not process]
+                except Exception:
+                    pass
 
         watcher = threading.Thread(target=_watch, daemon=True)
         watcher.start()

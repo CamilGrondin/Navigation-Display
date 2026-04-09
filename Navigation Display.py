@@ -71,6 +71,13 @@ VERTICAL_ORIENTATION = getattr(Qt, 'Vertical', getattr(getattr(Qt, 'Orientation'
 FLAT_CAP_STYLE = getattr(Qt, 'FlatCap', getattr(getattr(Qt, 'PenCapStyle', Qt), 'FlatCap'))
 POINTING_HAND_CURSOR = getattr(Qt, 'PointingHandCursor', getattr(getattr(Qt, 'CursorShape', Qt), 'PointingHandCursor'))
 
+if sys.platform == 'darwin':
+    MONOSPACE_FAMILY = 'Menlo'
+elif sys.platform.startswith('win'):
+    MONOSPACE_FAMILY = 'Consolas'
+else:
+    MONOSPACE_FAMILY = 'DejaVu Sans Mono'
+
 KEY_UP = getattr(Qt, 'Key_Up', getattr(getattr(Qt, 'Key', Qt), 'Key_Up'))
 KEY_DOWN = getattr(Qt, 'Key_Down', getattr(getattr(Qt, 'Key', Qt), 'Key_Down'))
 KEY_RIGHT = getattr(Qt, 'Key_Right', getattr(getattr(Qt, 'Key', Qt), 'Key_Right'))
@@ -134,6 +141,17 @@ def prompt_int(label: str, default: Optional[int] = None) -> int:
 
 
 def choose_mode() -> int:
+    env_mode = os.environ.get('NAVIGATION_DISPLAY_MODE')
+    if env_mode is not None:
+        try:
+            mode = int(env_mode.strip())
+            if mode in (MODE_MANUAL, MODE_XPLANE, MODE_MSP):
+                print(f'Mode force via NAVIGATION_DISPLAY_MODE={mode}.')
+                return mode
+            print(f'NAVIGATION_DISPLAY_MODE invalide ({env_mode!r}), retour au choix interactif.')
+        except ValueError:
+            print(f'NAVIGATION_DISPLAY_MODE invalide ({env_mode!r}), retour au choix interactif.')
+
     print('Navigation Display')
     print('1 - Controle manuel (clavier)')
     print('2 - Donnees temps reel X-Plane (UDP)')
@@ -146,6 +164,17 @@ def choose_mode() -> int:
 
 
 def choose_screen_layout() -> bool:
+    env_layout = os.environ.get('NAVIGATION_DISPLAY_LAYOUT')
+    if env_layout is not None:
+        token = env_layout.strip().lower()
+        if token in ('1', 'full', 'complete', 'panels', 'with-panels', 'avec-panneaux'):
+            print(f'Affichage force via NAVIGATION_DISPLAY_LAYOUT={env_layout} (ecran complet).')
+            return True
+        if token in ('2', 'center', 'minimal', 'no-panels', 'sans-panneaux'):
+            print(f'Affichage force via NAVIGATION_DISPLAY_LAYOUT={env_layout} (ecran central).')
+            return False
+        print(f'NAVIGATION_DISPLAY_LAYOUT invalide ({env_layout!r}), retour au choix interactif.')
+
     print('Affichage')
     print('1 - Ecran complet (panneaux lateraux + ecran central)')
     print('2 - Ecran central uniquement')
@@ -474,9 +503,40 @@ def build_navigation_source(mode: int):
         return None
 
     if mode == MODE_XPLANE:
-        ip = prompt_text('Adresse IP X-Plane', '127.0.0.1')
-        port = prompt_int('Port UDP X-Plane', 49000)
-        local_port = prompt_int('Port UDP local ecoute', 49005)
+        ip_env = os.environ.get('NAVIGATION_DISPLAY_XPLANE_IP', '').strip()
+        port_env = os.environ.get('NAVIGATION_DISPLAY_XPLANE_PORT', '').strip()
+        local_port_env = os.environ.get('NAVIGATION_DISPLAY_XPLANE_LOCAL_PORT', '').strip()
+
+        ip = ip_env or prompt_text('Adresse IP X-Plane', '127.0.0.1')
+        if ip_env:
+            print(f'Adresse X-Plane forcee via NAVIGATION_DISPLAY_XPLANE_IP={ip}.')
+
+        if port_env:
+            try:
+                port = int(port_env)
+                print(f'Port X-Plane force via NAVIGATION_DISPLAY_XPLANE_PORT={port}.')
+            except ValueError:
+                print(f'NAVIGATION_DISPLAY_XPLANE_PORT invalide ({port_env!r}), retour au prompt.')
+                port = prompt_int('Port UDP X-Plane', 49000)
+        else:
+            port = prompt_int('Port UDP X-Plane', 49000)
+
+        if local_port_env:
+            try:
+                local_port = int(local_port_env)
+                print(
+                    'Port local force via '
+                    f'NAVIGATION_DISPLAY_XPLANE_LOCAL_PORT={local_port}.'
+                )
+            except ValueError:
+                print(
+                    f'NAVIGATION_DISPLAY_XPLANE_LOCAL_PORT invalide ({local_port_env!r}), '
+                    'retour au prompt.'
+                )
+                local_port = prompt_int('Port UDP local ecoute', 49005)
+        else:
+            local_port = prompt_int('Port UDP local ecoute', 49005)
+
         try:
             source = XPlaneUDPRealtimeSource(ip=ip, port=port, local_port=local_port)
             source.start()
@@ -486,8 +546,23 @@ def build_navigation_source(mode: int):
             print('Demarrage sans source X-Plane.')
             return None
 
-    port = prompt_text('Port serie MSP', 'COM3')
-    baudrate = prompt_int('Baud rate MSP', 115200)
+    msp_port_env = os.environ.get('NAVIGATION_DISPLAY_MSP_PORT', '').strip()
+    msp_baud_env = os.environ.get('NAVIGATION_DISPLAY_MSP_BAUDRATE', '').strip()
+
+    port = msp_port_env or prompt_text('Port serie MSP', 'COM3')
+    if msp_port_env:
+        print(f'Port MSP force via NAVIGATION_DISPLAY_MSP_PORT={port}.')
+
+    if msp_baud_env:
+        try:
+            baudrate = int(msp_baud_env)
+            print(f'Baudrate MSP force via NAVIGATION_DISPLAY_MSP_BAUDRATE={baudrate}.')
+        except ValueError:
+            print(f'NAVIGATION_DISPLAY_MSP_BAUDRATE invalide ({msp_baud_env!r}), retour au prompt.')
+            baudrate = prompt_int('Baud rate MSP', 115200)
+    else:
+        baudrate = prompt_int('Baud rate MSP', 115200)
+
     try:
         source = MSPGPSRealtimeSource(port=port, baudrate=baudrate)
         source.start()
@@ -1725,20 +1800,40 @@ class Tar1090Widget(QWidget):
             )
             return
 
+        self._create_web_view()
+
+    def _clear_layout(self):
+        layout = self.layout()
+        if layout is None:
+            layout = QVBoxLayout(self)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.setSpacing(0)
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        return layout
+
+    def _create_web_view(self):
+        layout = self._clear_layout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
         try:
             self.web_view = QWebEngineView()
             self.web_view.setContextMenuPolicy(NO_CONTEXT_MENU)
             layout.addWidget(self.web_view)
-            
-            # Configure WebEngine explicitly for complex map rendering in tar1090
+
+            # Configure WebEngine explicitly for complex map rendering in tar1090.
             settings = self.web_view.settings()
-            settings.setAttribute(QWebEngineSettings.WebGLEnabled, True)
-            settings.setAttribute(QWebEngineSettings.LocalContentCanAccessRemoteUrls, True)
-            settings.setAttribute(QWebEngineSettings.LocalContentCanAccessFileUrls, True)
-            settings.setAttribute(QWebEngineSettings.AllowRunningInsecureContent, True)
-            settings.setAttribute(QWebEngineSettings.JavascriptEnabled, True)
-            settings.setAttribute(QWebEngineSettings.LocalStorageEnabled, True)
-            
+            if settings is not None:
+                settings.setAttribute(QWebEngineSettings.WebGLEnabled, True)
+                settings.setAttribute(QWebEngineSettings.LocalContentCanAccessRemoteUrls, True)
+                settings.setAttribute(QWebEngineSettings.LocalContentCanAccessFileUrls, True)
+                settings.setAttribute(QWebEngineSettings.AllowRunningInsecureContent, True)
+                settings.setAttribute(QWebEngineSettings.JavascriptEnabled, True)
+                settings.setAttribute(QWebEngineSettings.LocalStorageEnabled, True)
+
             class WebPage(QWebEnginePage):
                 def javaScriptConsoleMessage(self, level, message, lineNumber, sourceID):
                     # Use numeric levels for compatibility across PyQt5 variants.
@@ -1758,10 +1853,15 @@ class Tar1090Widget(QWidget):
 
             # Load lazily when the tab is visible; loading while hidden can leave map size at 0x0.
             self.web_view.loadFinished.connect(self._on_load_finished)
-            
+            self._initial_load_pending = True
+            self._load_retry_count = 0
         except Exception as exc:
             self.web_view = None
-            self._build_placeholder(f'Erreur lors du chargement de tar1090 : {exc}')
+            self._build_placeholder(
+                f'Erreur lors du chargement de tar1090 : {exc}',
+                open_url=self._target_url(),
+                allow_retry=True,
+            )
 
     def ensure_loaded(self):
         if not self.web_view:
@@ -1841,6 +1941,7 @@ class Tar1090Widget(QWidget):
                 'Impossible de charger la carte ADS-B apres plusieurs tentatives.\n\n'
                 'Verifiez que readsb et le serveur HTTP local sont demarres puis reessayez.',
                 open_url=self._target_url(),
+                allow_retry=True,
             )
             return
 
@@ -1874,6 +1975,7 @@ class Tar1090Widget(QWidget):
             'Le service ADS-B est actif, mais QtWebEngine plante sur cette page.\n'
             'Ouvrez tar1090 dans le navigateur avec le bouton ci-dessous.',
             open_url=self._target_url(),
+            allow_retry=True,
         )
 
     def reload_page(self):
@@ -1889,19 +1991,25 @@ class Tar1090Widget(QWidget):
         except Exception as exc:
             print(f'Impossible d ouvrir le navigateur: {exc}')
 
-    def _build_placeholder(self, message, open_url=None):
+    def _retry_embedded_view(self):
+        if QWebEngineView is None or QWebEngineSettings is None or QWebEnginePage is None:
+            self._build_placeholder(
+                'PyQtWebEngine est requis pour afficher la carte tar1090.\n'
+                'Installez pyqtwebengine.',
+            )
+            return
         self._stability_timer.stop()
         self._reload_timer.stop()
-        layout = self.layout()
-        if layout is None:
-            layout = QVBoxLayout(self)
-            layout.setContentsMargins(0, 0, 0, 0)
-            layout.setSpacing(0)
-        while layout.count():
-            item = layout.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                widget.deleteLater()
+        self._render_crash_count = 0
+        self._load_retry_count = 0
+        self._initial_load_pending = True
+        self._create_web_view()
+        self.ensure_loaded()
+
+    def _build_placeholder(self, message, open_url=None, allow_retry=False):
+        self._stability_timer.stop()
+        self._reload_timer.stop()
+        layout = self._clear_layout()
         self.web_view = None
         layout.setContentsMargins(40, 40, 40, 40)
         layout.setSpacing(12)
@@ -1924,7 +2032,7 @@ class Tar1090Widget(QWidget):
         )
         hint.setWordWrap(True)
         hint.setAlignment(ALIGN_CENTER)
-        hint.setStyleSheet('color: #aaa; font: 12px monospace;')
+        hint.setStyleSheet(f'color: #aaa; font: 12px "{MONOSPACE_FAMILY}";')
 
         open_button = None
         if open_url:
@@ -1939,12 +2047,25 @@ class Tar1090Widget(QWidget):
                 lambda _checked=False, target=open_url: self._open_external_url(target)
             )
 
+        retry_button = None
+        if allow_retry:
+            retry_button = QPushButton('Reessayer dans l application')
+            retry_button.setCursor(POINTING_HAND_CURSOR)
+            retry_button.setStyleSheet(
+                'QPushButton { background: #2f3f57; color: white; border: none; '
+                'padding: 10px 16px; border-radius: 6px; font: bold 13px Arial; } '
+                'QPushButton:hover { background: #3e5678; }'
+            )
+            retry_button.clicked.connect(self._retry_embedded_view)
+
         layout.addStretch()
         layout.addWidget(title)
         layout.addSpacing(12)
         layout.addWidget(content)
+        if retry_button is not None:
+            layout.addWidget(retry_button)
         if open_button is not None:
-            layout.addWidget(open_button, 0, ALIGN_CENTER)
+            layout.addWidget(open_button)
         layout.addSpacing(8)
         layout.addWidget(hint)
         layout.addStretch()
@@ -2244,14 +2365,14 @@ class NavigationDisplayWidget(QWidget):
 
         painter.drawText(banner_rect.adjusted(14, 32, -com_block_width, -4), ALIGN_LEFT | ALIGN_VCENTER, speed_text)
 
-        com_font = QFont('Consolas', 11, QFont.Bold)
+        com_font = QFont(MONOSPACE_FAMILY, 11, QFont.Bold)
         painter.setFont(com_font)
         com1_text = f"COM1  {self.com1_active}  <->  {self.com1_standby}"
         com2_text = f"COM2  {self.com2_active}  <->  {self.com2_standby}"
         painter.drawText(banner_rect.adjusted(0, 8, -18, -32), ALIGN_RIGHT | ALIGN_VCENTER, com1_text)
         painter.drawText(banner_rect.adjusted(0, 32, -18, -6), ALIGN_RIGHT | ALIGN_VCENTER, com2_text)
 
-        status_font = QFont('Consolas', 9, QFont.Bold)
+        status_font = QFont(MONOSPACE_FAMILY, 9, QFont.Bold)
         painter.setFont(status_font)
         painter.setPen(QColor(self.source_color))
         painter.drawText(banner_rect.adjusted(16, 0, -18, -48), ALIGN_RIGHT | ALIGN_VCENTER, self.source_status)

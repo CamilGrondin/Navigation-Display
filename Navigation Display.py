@@ -8,15 +8,17 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional, cast
+from typing import Callable, Dict, List, Optional, cast
 
 from PyQt5.QtCore import QPointF, QRectF, Qt, QTimer, QUrl
 from PyQt5.QtGui import QColor, QFont, QPainter, QPen, QPolygonF
 from PyQt5.QtWidgets import (
     QApplication,
     QComboBox,
+    QFrame,
     QHBoxLayout,
     QLabel,
+    QPushButton,
     QProgressBar,
     QTabWidget,
     QVBoxLayout,
@@ -116,6 +118,19 @@ def choose_mode() -> int:
         if mode in (MODE_MANUAL, MODE_XPLANE, MODE_MSP):
             return mode
         print('Le mode doit etre 1, 2 ou 3.')
+
+
+def choose_screen_layout() -> bool:
+    print('Affichage')
+    print('1 - Ecran complet (panneaux lateraux + ecran central)')
+    print('2 - Ecran central uniquement')
+    while True:
+        value = prompt_int('Choisir l affichage', 1)
+        if value == 1:
+            return True
+        if value == 2:
+            return False
+        print('Le choix doit etre 1 ou 2.')
 
 
 class XPlaneUDPRealtimeSource:
@@ -1315,6 +1330,79 @@ class FuelTank(QWidget):
         )
 
 
+class BezelSidePanel(QWidget):
+
+    def __init__(
+        self,
+        title: str,
+        button_labels: List[str],
+        handlers: Optional[Dict[str, Callable[[], None]]] = None,
+    ):
+        super().__init__()
+        self.handlers = handlers or {}
+        self.buttons: Dict[str, QPushButton] = {}
+        self.setFixedWidth(116)
+        self.setStyleSheet('background-color: #1f232a; border: 1px solid #4a5059; border-radius: 8px;')
+
+        layout = QVBoxLayout()
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+
+        title_label = QLabel(title)
+        title_label.setAlignment(ALIGN_CENTER)
+        title_label.setStyleSheet('color: #d7dbe4; font: bold 18px Arial; border: none;')
+        layout.addWidget(title_label)
+
+        for label_text in button_labels:
+            button = QPushButton(label_text)
+            button.setMinimumHeight(40)
+            button.setStyleSheet(
+                'QPushButton { color: #eceff4; font: bold 10px Arial; background-color: #2b3038; '
+                'border: 1px solid #626a75; border-radius: 5px; }'
+                'QPushButton:pressed { background-color: #3c4350; }'
+            )
+            callback = self.handlers.get(label_text)
+            if callback is not None:
+                button.clicked.connect(callback)
+            self.buttons[label_text] = button
+            layout.addWidget(button)
+
+        layout.addStretch()
+        knob = QLabel('O')
+        knob.setAlignment(ALIGN_CENTER)
+        knob.setStyleSheet(
+            'color: #aeb6c3; font: bold 28px Arial; background-color: #171a1f; '
+            'border: 2px solid #606875; border-radius: 28px; min-height: 56px;'
+        )
+        layout.addWidget(knob)
+        self.setLayout(layout)
+
+
+class SoftKeyStrip(QWidget):
+
+    def __init__(self, labels: List[str], handlers: Optional[Dict[str, Callable[[], None]]] = None):
+        super().__init__()
+        self.handlers = handlers or {}
+        layout = QHBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+
+        for label_text in labels:
+            key = QPushButton(label_text or ' ')
+            key.setMinimumHeight(34)
+            key.setStyleSheet(
+                'QPushButton { color: #f3f5f7; font: bold 11px Arial; background-color: #2a2f37; '
+                'border: 1px solid #5f6672; border-radius: 5px; min-width: 60px; }'
+                'QPushButton:pressed { background-color: #3d4552; }'
+            )
+            callback = self.handlers.get(label_text)
+            if callback is not None:
+                key.clicked.connect(callback)
+            layout.addWidget(key)
+
+        self.setLayout(layout)
+
+
 
 
 
@@ -1335,6 +1423,7 @@ class GPSWidget(QWidget):
                 'PyQtWebEngine est introuvable.\nInstallez pyqtwebengine pour afficher la carte GPS.'
             )
             return
+
         try:
             self.web_view = QWebEngineView()
             self.web_view.setContextMenuPolicy(NO_CONTEXT_MENU)
@@ -1581,6 +1670,15 @@ class Tar1090Widget(QWidget):
         self.setLayout(layout)
         self.web_view = None
 
+        if os.environ.get('NAVIGATION_DISPLAY_AUTOSTART_ADSB', '').strip() != '1':
+            self._build_placeholder(
+                'Les services ADS-B ne sont pas démarrés automatiquement.\n\n'
+                'Pour activer tar1090, lancez readsb et le serveur HTTP manuellement, '
+                'ou définissez NAVIGATION_DISPLAY_AUTOSTART_ADSB=1 avant de démarrer '
+                'l’application.'
+            )
+            return
+
         if QWebEngineView is None:
             self._build_placeholder(
                 'PyQtWebEngine est requis pour afficher la carte tar1090.\n'
@@ -1625,7 +1723,11 @@ class Tar1090Widget(QWidget):
             'Lancez les commandes suivantes dans un terminal :\n\n'
             'readsb --net --device-type rtlsdr --gain auto '
             '--write-json-every 0.5 --write-json ~/tar1090/html/data\n\n'
-            'cd ~/tar1090/html && python3 -m http.server 8081'
+            'cd ~/tar1090/html && python3 -m http.server 8081\n\n'
+            "Si readsb affiche usb_claim_interface error -3, arrêtez toute autre instance "
+            'ou détachez le pilote kernel dvb_usb_rtl28xxu.\n\n'
+            'Astuce: NAVIGATION_DISPLAY_AUTOSTART_ADSB=1 réactive le démarrage '
+            'automatique.'
         )
         hint.setWordWrap(True)
         hint.setAlignment(ALIGN_CENTER)
@@ -1652,6 +1754,15 @@ class Tar1090Widget(QWidget):
         layout.setSpacing(0)
         self.setLayout(layout)
         self.web_view = None
+
+        if os.environ.get('NAVIGATION_DISPLAY_AUTOSTART_ADSB', '').strip() != '1':
+            self._build_placeholder(
+                'Les services ADS-B ne sont pas démarrés automatiquement.\n\n'
+                'Pour activer tar1090, lancez readsb et le serveur HTTP manuellement, '
+                'ou définissez NAVIGATION_DISPLAY_AUTOSTART_ADSB=1 avant de démarrer '
+                'l’application.'
+            )
+            return
 
         if QWebEngineView is None:
             self._build_placeholder(
@@ -1697,7 +1808,11 @@ class Tar1090Widget(QWidget):
             'Lancez les commandes suivantes dans un terminal :\n\n'
             'readsb --net --device-type rtlsdr --gain auto '
             '--write-json-every 0.5 --write-json ~/tar1090/html/data\n\n'
-            'cd ~/tar1090/html && python3 -m http.server 8081'
+            'cd ~/tar1090/html && python3 -m http.server 8081\n\n'
+            "Si readsb affiche usb_claim_interface error -3, arrêtez toute autre instance "
+            'ou détachez le pilote kernel dvb_usb_rtl28xxu.\n\n'
+            'Astuce: NAVIGATION_DISPLAY_AUTOSTART_ADSB=1 réactive le démarrage '
+            'automatique.'
         )
         hint.setWordWrap(True)
         hint.setAlignment(ALIGN_CENTER)
@@ -1899,7 +2014,27 @@ class NavigationDisplayWidget(QWidget):
 
         painter.setRenderHint(QPainter.Antialiasing)
 
-        painter.fillRect(self.rect(), QColor('#050a11'))
+        if self.mode == 'ARC':
+            painter.fillRect(self.rect(), QColor('#d09a2b'))
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(172, 124, 24, 120))
+            painter.drawEllipse(QRectF(self.width() * 0.02, self.height() * 0.18, self.width() * 0.22, self.height() * 0.12))
+            painter.drawEllipse(QRectF(self.width() * 0.74, self.height() * 0.72, self.width() * 0.24, self.height() * 0.16))
+            painter.setBrush(QColor(126, 92, 18, 90))
+            painter.drawEllipse(QRectF(self.width() * 0.08, self.height() * 0.54, self.width() * 0.30, self.height() * 0.20))
+            painter.drawEllipse(QRectF(self.width() * 0.62, self.height() * 0.28, self.width() * 0.20, self.height() * 0.13))
+            painter.setPen(QPen(QColor('#ff00c4'), 3))
+            painter.drawLine(
+                QPointF(self.width() * 0.50, self.height() * 0.14),
+                QPointF(self.width() * 0.50, self.height() * 0.88),
+            )
+            painter.setPen(QPen(QColor('#1f1f1f'), 2))
+            painter.drawLine(
+                QPointF(self.width() * 0.57, self.height() * 0.14),
+                QPointF(self.width() * 0.57, self.height() * 0.88),
+            )
+        else:
+            painter.fillRect(self.rect(), QColor('#050a11'))
 
         center, radius = self._compute_geometry()
 
@@ -2000,9 +2135,13 @@ class NavigationDisplayWidget(QWidget):
 
     def _draw_range_rings(self, painter, center, radius):
 
-        painter.setPen(QPen(QColor('#1f8dd6'), 2))
 
-        max_rings = 3
+        if self.mode == 'ARC':
+            painter.setPen(QPen(QColor('#eceef0'), 2))
+            max_rings = 1
+        else:
+            painter.setPen(QPen(QColor('#1f8dd6'), 2))
+            max_rings = 3
 
         for ring in range(1, max_rings + 1):
 
@@ -2026,11 +2165,11 @@ class NavigationDisplayWidget(QWidget):
 
 
     def _draw_heading_marks(self, painter, center, radius):
-
         rose_radius = radius + (28 if self.mode != 'ARC' else 18)
         ring_rect = QRectF(center.x() - rose_radius, center.y() - rose_radius, rose_radius * 2, rose_radius * 2)
 
-        ring_pen = QPen(QColor('#5a6a88'), 2)
+        ring_color = '#eceef0' if self.mode == 'ARC' else '#5a6a88'
+        ring_pen = QPen(QColor(ring_color), 2)
         ring_pen.setCapStyle(Qt.FlatCap)
         painter.setPen(ring_pen)
         painter.setBrush(Qt.NoBrush)
@@ -2040,7 +2179,7 @@ class NavigationDisplayWidget(QWidget):
         else:
             painter.drawEllipse(ring_rect)
 
-        tick_pen = QPen(QColor('#d7dbe4'), 2)
+        tick_pen = QPen(QColor('#f2f4f5' if self.mode == 'ARC' else '#d7dbe4'), 2)
         painter.setPen(tick_pen)
 
         def _bearing_visible(bearing):
@@ -2391,19 +2530,22 @@ class CapWidget(QWidget):
 
 class EngineDisplay(QWidget):
 
-    def __init__(self, startup_mode=MODE_XPLANE, data_source=None):
+    def __init__(self, startup_mode=MODE_XPLANE, data_source=None, show_side_panels: bool = True):
 
         super().__init__()
 
-        self.setWindowTitle('DA40 Engine Display (PyQt5)')
+        self.setWindowTitle('X-Plane 1000 Navigation Display')
 
-        self.setGeometry(50, 50, 1400, 700)
+        self.setGeometry(30, 30, 1520, 920)
 
-        self.setStyleSheet('background-color: black')
+        self.setStyleSheet('background-color: #050505;')
 
         self._local_service_processes = []
         self.startup_mode = startup_mode
         self.data_source = data_source
+        self.show_side_panels = bool(show_side_panels)
+        self._xplane_cmd_target: Optional[tuple[str, int]] = None
+        self._xplane_cmd_socket: Optional[socket.socket] = None
         self._source_error_reported = False
         self._last_source_rx_time: Optional[float] = None
 
@@ -2495,6 +2637,26 @@ class EngineDisplay(QWidget):
         ]
 
         self.nav_mode = 'ARC'
+        self._ranges = [5, 10, 20, 40, 80]
+
+        if self.startup_mode in (MODE_XPLANE, MODE_MANUAL):
+            xplane_ip = os.environ.get('NAV_DISPLAY_XPLANE_IP', '127.0.0.1').strip() or '127.0.0.1'
+            xplane_port_raw = os.environ.get('NAV_DISPLAY_XPLANE_PORT', '49000').strip() or '49000'
+            try:
+                xplane_port = int(xplane_port_raw)
+            except Exception:
+                xplane_port = 49000
+            default_target = (xplane_ip, xplane_port)
+            if self.data_source is not None and hasattr(self.data_source, 'ip') and hasattr(self.data_source, 'port'):
+                try:
+                    default_target = (str(self.data_source.ip), int(self.data_source.port))
+                except Exception:
+                    pass
+            self._xplane_cmd_target = default_target
+            try:
+                self._xplane_cmd_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            except Exception:
+                self._xplane_cmd_socket = None
 
         if self.startup_mode == MODE_XPLANE:
             self.source_status = 'SRC XPLANE CONNECTING'
@@ -2508,9 +2670,10 @@ class EngineDisplay(QWidget):
 
 
 
-        main_layout = QHBoxLayout()
+        main_layout = QVBoxLayout()
 
-        main_layout.setContentsMargins(18, 10, 18, 18)
+        main_layout.setContentsMargins(24, 20, 24, 20)
+        main_layout.setSpacing(0)
 
 
 
@@ -2576,25 +2739,98 @@ class EngineDisplay(QWidget):
 
         self.display_tabs.addTab(self.tar1090_widget, 'ADS-B Radar')
 
+        self.display_tabs.setCurrentWidget(self.cap_widget)
+        self.display_tabs.setStyleSheet(
+            'QTabWidget::pane { border: 1px solid #5b636f; background: #0a0e15; }'
+            'QTabBar::tab { background: #1a1f26; color: #c5cedb; padding: 6px 12px; border: 1px solid #4f5763; }'
+            'QTabBar::tab:selected { background: #2a6fc7; color: white; }'
+        )
 
-        gps_container = QWidget()
+        bezel_frame = QFrame()
+        bezel_frame.setObjectName('bezelFrame')
+        bezel_frame.setStyleSheet(
+            'QFrame#bezelFrame {'
+            'background-color: #20252d; border: 2px solid #565d68; border-radius: 14px;'
+            '}'
+        )
 
-        gps_container.setStyleSheet('border: 3px solid white;')
+        bezel_layout = QVBoxLayout()
+        bezel_layout.setContentsMargins(12, 12, 12, 12)
+        bezel_layout.setSpacing(10)
 
-        gps_layout = QVBoxLayout()
+        top_header = QLabel('X-PLANE 1000')
+        top_header.setAlignment(ALIGN_CENTER)
+        top_header.setFixedHeight(34)
+        top_header.setStyleSheet(
+            'color: #d7dbe4; font: bold 17px Arial; '
+            'background-color: #161a20; border: 1px solid #4f5762; border-radius: 6px;'
+        )
+        bezel_layout.addWidget(top_header)
 
-        gps_layout.setContentsMargins(0, 0, 0, 0)
+        center_row = QHBoxLayout()
+        center_row.setSpacing(10)
 
-        gps_layout.addWidget(self.display_tabs)
+        left_handlers = {
+            'PUSH\nVOL ID': self._action_ap_master_toggle,
+            'HDG': self._action_heading_plus,
+            'AP': self._action_sync_ap_heading,
+            'NAV': self._action_ap_nav,
+            'APR': self._action_ap_apr,
+            'ALT': self._action_ap_alt,
+        }
+        right_handlers = {
+            'PUSH\nVOL SQ': self._action_radio_swap_com1,
+            'CRS-BARO': self._action_radio_com1_coarse_up,
+            'RANGE': self._action_radio_com1_fine_up,
+            'PAN': self._action_radio_swap_com2,
+            'FPL': self._action_radio_com2_coarse_up,
+            'PROC': self._action_radio_com2_fine_up,
+        }
+        if self.show_side_panels:
+            left_bezel = BezelSidePanel('NAV', ['PUSH\nVOL ID', 'HDG', 'AP', 'NAV', 'APR', 'ALT'], left_handlers)
+            center_row.addWidget(left_bezel)
 
-        gps_container.setLayout(gps_layout)
+        screen_container = QFrame()
+        screen_container.setStyleSheet('background-color: #05070a; border: 1px solid #707887;')
+        screen_layout = QHBoxLayout()
+        screen_layout.setContentsMargins(8, 8, 8, 8)
+        screen_layout.setSpacing(8)
 
+        if self.show_side_panels:
+            engine_strip = QFrame()
+            engine_strip.setFixedWidth(258)
+            engine_strip.setStyleSheet('background-color: #090d12; border: 1px solid #3f4751;')
+            engine_strip.setLayout(left_col)
+            screen_layout.addWidget(engine_strip)
 
+        center_display = QFrame()
+        center_display.setStyleSheet('background-color: #020406; border: 2px solid #aeb6c3;')
+        center_display_layout = QVBoxLayout()
+        center_display_layout.setContentsMargins(0, 0, 0, 0)
+        center_display_layout.setSpacing(0)
+        center_display_layout.addWidget(self.display_tabs)
+        center_display.setLayout(center_display_layout)
 
-        main_layout.addLayout(left_col)
+        screen_layout.addWidget(center_display, stretch=1)
+        screen_container.setLayout(screen_layout)
 
-        main_layout.addWidget(gps_container, stretch=1)
+        center_row.addWidget(screen_container, stretch=1)
+        if self.show_side_panels:
+            right_bezel = BezelSidePanel('COM', ['PUSH\nVOL SQ', 'CRS-BARO', 'RANGE', 'PAN', 'FPL', 'PROC'], right_handlers)
+            center_row.addWidget(right_bezel)
+        bezel_layout.addLayout(center_row, stretch=1)
 
+        softkey_handlers = {
+            'SYSTEM': self._action_tab_gps,
+            'MAP': self._action_tab_greece,
+            'NAV': self._action_tab_cap,
+            'DCLTR': self._action_mode_cycle,
+        }
+        softkeys = SoftKeyStrip(['SYSTEM', '', 'MAP', '', '', '', '', '', 'NAV', '', 'DCLTR', ''], softkey_handlers)
+        bezel_layout.addWidget(softkeys)
+
+        bezel_frame.setLayout(bezel_layout)
+        main_layout.addWidget(bezel_frame)
         self.setLayout(main_layout)
 
 
@@ -2611,8 +2847,176 @@ class EngineDisplay(QWidget):
 
         self.update_display()
 
+    def _send_xplane_dref(self, dataref: str, value: float):
+        if self._xplane_cmd_socket is None or self._xplane_cmd_target is None:
+            return
+        try:
+            payload = struct.pack('<f500s', float(value), dataref.encode('ascii'))
+            packet = b'DREF\x00' + payload
+            self._xplane_cmd_socket.sendto(packet, self._xplane_cmd_target)
+        except Exception:
+            pass
+
+    def _send_xplane_command(self, command: str):
+        if self._xplane_cmd_socket is None or self._xplane_cmd_target is None:
+            return
+        try:
+            packet = b'CMND\x00' + command.encode('ascii')
+            self._xplane_cmd_socket.sendto(packet, self._xplane_cmd_target)
+        except Exception:
+            pass
+
+    def _push_navigation_to_xplane(self):
+        try:
+            selected_alt = float(str(self.altitude_target).split()[0])
+        except Exception:
+            selected_alt = 2500.0
+        self._send_xplane_dref('sim/cockpit/autopilot/heading_mag', self.desired_track)
+        self._send_xplane_dref('sim/cockpit2/autopilot/heading_dial_deg_mag_pilot', self.desired_track)
+        self._send_xplane_dref('sim/cockpit/radios/nav1_obs_degm', self.desired_track)
+        self._send_xplane_dref('sim/cockpit2/autopilot/altitude_dial_ft', selected_alt)
+
+    def _format_freq(self, value: float) -> str:
+        return f'{value:.3f}'
+
+    def _send_com_standby(self, index: int, freq_mhz: float):
+        freq_mhz = max(118.000, min(136.975, freq_mhz))
+        hz833 = int(round(freq_mhz * 1000.0))
+        hz25 = int(round(freq_mhz * 100.0))
+        if index == 1:
+            self._send_xplane_dref('sim/cockpit/radios/com1_stdby_freq_hz_833', hz833)
+            self._send_xplane_dref('sim/cockpit/radios/com1_stdby_freq_hz', hz25)
+        else:
+            self._send_xplane_dref('sim/cockpit/radios/com2_stdby_freq_hz_833', hz833)
+            self._send_xplane_dref('sim/cockpit/radios/com2_stdby_freq_hz', hz25)
+
+    def _action_ap_master_toggle(self):
+        self._send_xplane_command('sim/autopilot/servos_toggle')
+
+    def _action_ap_nav(self):
+        self._send_xplane_command('sim/autopilot/NAV')
+
+    def _action_ap_apr(self):
+        self._send_xplane_command('sim/autopilot/approach')
+
+    def _action_ap_alt(self):
+        self._send_xplane_command('sim/autopilot/altitude_hold')
+
+    def _action_source_cycle(self):
+        self.gps_source = 'GPS2' if self.gps_source == 'GPS1' else 'GPS1'
+        self.update_display()
+
+    def _action_heading_plus(self):
+        self.desired_track = (self.desired_track + 1) % 360
+        self._push_navigation_to_xplane()
+        self.update_display()
+
+    def _action_sync_ap_heading(self):
+        self.desired_track = self.heading
+        self._send_xplane_dref('sim/cockpit/autopilot/heading_mag', self.desired_track)
+        self._send_xplane_dref('sim/cockpit2/autopilot/heading_dial_deg_mag_pilot', self.desired_track)
+        self._send_xplane_command('sim/autopilot/heading')
+        self.update_display()
+
+    def _action_tab_cap(self):
+        self.display_tabs.setCurrentWidget(self.cap_widget)
+
+    def _action_mode_arc(self):
+        self.nav_mode = 'ARC'
+        self.update_display()
+
+    def _action_altitude_plus(self):
+        try:
+            current = int(str(self.altitude_target).split()[0])
+        except Exception:
+            current = 2500
+        current = min(12000, current + 100)
+        self.altitude_target = f'{current} FT'
+        self._send_xplane_dref('sim/cockpit2/autopilot/altitude_dial_ft', float(current))
+        self.update_display()
+
+    def _action_tab_gps(self):
+        self.display_tabs.setCurrentWidget(self.gps)
+
+    def _action_course_plus(self):
+        self.desired_track = (self.desired_track + 5) % 360
+        self._send_xplane_dref('sim/cockpit/radios/nav1_obs_degm', self.desired_track)
+        self._send_xplane_dref('sim/cockpit/radios/nav2_obs_degm', self.desired_track)
+        self.update_display()
+
+    def _action_radio_swap_com1(self):
+        self.com1_active, self.com1_standby = self.com1_standby, self.com1_active
+        self._send_xplane_command('sim/radios/com1_standy_flip')
+        self.update_display()
+
+    def _action_radio_com1_coarse_up(self):
+        freq = float(self.com1_standby)
+        freq = min(136.975, freq + 1.0)
+        self.com1_standby = self._format_freq(freq)
+        self._send_com_standby(1, freq)
+        self._send_xplane_command('sim/radios/stby_com1_coarse_up')
+        self.update_display()
+
+    def _action_radio_com1_fine_up(self):
+        freq = float(self.com1_standby)
+        freq += 0.005
+        if freq > 136.975:
+            freq = 118.000
+        self.com1_standby = self._format_freq(freq)
+        self._send_com_standby(1, freq)
+        self._send_xplane_command('sim/radios/stby_com1_fine_up')
+        self._send_xplane_command('sim/radios/stby_com1_fine_up_833')
+        self.update_display()
+
+    def _action_radio_swap_com2(self):
+        self.com2_active, self.com2_standby = self.com2_standby, self.com2_active
+        self._send_xplane_command('sim/radios/com2_standy_flip')
+        self.update_display()
+
+    def _action_radio_com2_coarse_up(self):
+        freq = float(self.com2_standby)
+        freq = min(136.975, freq + 1.0)
+        self.com2_standby = self._format_freq(freq)
+        self._send_com_standby(2, freq)
+        self._send_xplane_command('sim/radios/stby_com2_coarse_up')
+        self.update_display()
+
+    def _action_radio_com2_fine_up(self):
+        freq = float(self.com2_standby)
+        freq += 0.005
+        if freq > 136.975:
+            freq = 118.000
+        self.com2_standby = self._format_freq(freq)
+        self._send_com_standby(2, freq)
+        self._send_xplane_command('sim/radios/stby_com2_fine_up')
+        self._send_xplane_command('sim/radios/stby_com2_fine_up_833')
+        self.update_display()
+
+    def _action_range_cycle(self):
+        try:
+            idx = self._ranges.index(int(self.range_nm))
+            self.range_nm = self._ranges[(idx + 1) % len(self._ranges)]
+        except Exception:
+            self.range_nm = self._ranges[0]
+        self.update_display()
+
+    def _action_mode_cycle(self):
+        self.nav_mode = self.cap_widget.cycle_mode()
+        self.update_display()
+
+    def _action_tab_greece(self):
+        self.display_tabs.setCurrentWidget(self.greece_widget)
+
+    def _action_tab_adsb(self):
+        self.display_tabs.setCurrentWidget(self.tar1090_widget)
+
 
     def _start_local_services(self):
+
+        if os.environ.get('NAVIGATION_DISPLAY_AUTOSTART_ADSB', '').strip() != '1':
+            print('Démarrage ADS-B automatique désactivé. Définissez NAVIGATION_DISPLAY_AUTOSTART_ADSB=1 '
+                  'pour lancer readsb et le serveur HTTP au démarrage.')
+            return
 
         data_dir = os.path.expanduser('~/tar1090/html/data')
         http_dir = os.path.expanduser('~/tar1090/html')
@@ -2658,6 +3062,32 @@ class EngineDisplay(QWidget):
                 print(f'Impossible de démarrer: {command}')
                 continue
             self._local_service_processes.append(process)
+            if command and command[0] == 'readsb':
+                self._monitor_service_startup(
+                    process,
+                    'readsb',
+                    'Le récepteur RTL-SDR est probablement déjà revendiqué par le pilote kernel '
+                    'ou une autre instance readsb. Fermez l’autre instance, puis détachez ou '
+                    'blacklistez dvb_usb_rtl28xxu si nécessaire.',
+                )
+
+
+    def _monitor_service_startup(self, process, label, failure_hint):
+        def _watch():
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                if process.poll() is not None:
+                    break
+                time.sleep(0.1)
+
+            return_code = process.poll()
+            if return_code not in (None, 0):
+                print(f'{label} a quitté immédiatement avec le code {return_code}.')
+                print(failure_hint)
+                self._stop_local_services()
+
+        watcher = threading.Thread(target=_watch, daemon=True)
+        watcher.start()
 
 
     def _stop_local_services(self):
@@ -2673,6 +3103,12 @@ class EngineDisplay(QWidget):
     def closeEvent(self, a0):
 
         self._stop_local_services()
+        if self._xplane_cmd_socket is not None:
+            try:
+                self._xplane_cmd_socket.close()
+            except Exception:
+                pass
+            self._xplane_cmd_socket = None
         if self.data_source and hasattr(self.data_source, 'stop'):
             try:
                 self.data_source.stop()
@@ -2979,6 +3415,7 @@ class EngineDisplay(QWidget):
 
             self.nav_mode = self.cap_widget.cycle_mode()
 
+        self._push_navigation_to_xplane()
         self.update_display()
 
 
@@ -2988,11 +3425,12 @@ class EngineDisplay(QWidget):
 def main():
 
     mode = choose_mode()
+    show_side_panels = choose_screen_layout()
     data_source = build_navigation_source(mode)
 
     app = QApplication(sys.argv)
 
-    window = EngineDisplay(startup_mode=mode, data_source=data_source)
+    window = EngineDisplay(startup_mode=mode, data_source=data_source, show_side_panels=show_side_panels)
 
     window.show()
 

@@ -59,6 +59,11 @@ try:
 except ImportError:  # pragma: no cover - optional dependency
     serial = None
 
+try:
+    import pygame  # type: ignore
+except ImportError:  # pragma: no cover - optional dependency
+    pygame = None
+
 
 ALIGN_CENTER = getattr(Qt, 'AlignCenter', getattr(getattr(Qt, 'AlignmentFlag', Qt), 'AlignCenter'))
 ALIGN_LEFT = getattr(Qt, 'AlignLeft', getattr(getattr(Qt, 'AlignmentFlag', Qt), 'AlignLeft'))
@@ -497,9 +502,110 @@ class MSPGPSRealtimeSource:
             return None
 
 
+class ManualJoystickSource:
+    """Source joystick USB pour le mode manuel (combinee avec le clavier)."""
+
+    def __init__(self, joystick_name_hint: str = ''):
+        if pygame is None:
+            raise RuntimeError('pygame est requis pour le joystick USB. Installez: pip install pygame')
+
+        pygame.init()
+        pygame.joystick.init()
+        count = pygame.joystick.get_count()
+        if count <= 0:
+            raise RuntimeError('Aucun joystick USB detecte.')
+
+        hint = (joystick_name_hint or '').strip().lower()
+        selected = None
+        for idx in range(count):
+            candidate = pygame.joystick.Joystick(idx)
+            candidate.init()
+            name = candidate.get_name()
+            if hint and hint in name.lower():
+                selected = candidate
+                break
+            if selected is None:
+                selected = candidate
+
+        if selected is None:
+            raise RuntimeError('Impossible d initialiser le joystick USB.')
+
+        self.joystick = selected
+        self.last_t = time.monotonic()
+        self.roll_deadzone = 0.08
+        self.max_turn_rate_deg_s = 16.0
+        self.load_tau = 1.0
+        self.current_load = 35.0
+        print(f'Joystick USB detecte: {self.joystick.get_name()}')
+
+    def _axis(self, index: int, default: float = 0.0) -> float:
+        if index >= self.joystick.get_numaxes():
+            return default
+        try:
+            return float(self.joystick.get_axis(index))
+        except Exception:
+            return default
+
+    def poll(self, timeout: float = 0.0) -> Optional[Dict[str, float]]:
+        del timeout
+        if pygame is None:
+            return None
+
+        try:
+            pygame.event.pump()
+        except Exception as exc:
+            raise RuntimeError(f'Lecture joystick interrompue: {exc}') from exc
+
+        now = time.monotonic()
+        dt = max(0.001, now - self.last_t)
+        self.last_t = now
+
+        roll_axis = self._axis(0, 0.0)
+        throttle_axis = self._axis(2, -1.0)
+        throttle = max(0.0, min(1.0, (-throttle_axis + 1.0) / 2.0))
+
+        turn_rate = 0.0 if abs(roll_axis) < self.roll_deadzone else roll_axis * self.max_turn_rate_deg_s
+        heading_delta = turn_rate * dt
+
+        target_load = 100.0 * throttle
+        load_alpha = min(1.0, dt / self.load_tau)
+        self.current_load += (target_load - self.current_load) * load_alpha
+
+        return {
+            'heading_delta': heading_delta,
+            'load': max(0.0, min(100.0, self.current_load)),
+        }
+
+    def stop(self):
+        try:
+            self.joystick.quit()
+        except Exception:
+            pass
+        try:
+            pygame.joystick.quit()
+        except Exception:
+            pass
+
+
 def build_navigation_source(mode: int):
     if mode == MODE_MANUAL:
         print('Mode 1 actif: controle manuel clavier')
+        joystick_setting = os.environ.get('NAVIGATION_DISPLAY_MANUAL_JOYSTICK', '1').strip().lower()
+        if joystick_setting in ('0', 'false', 'no'):
+            print('Joystick USB desactive via NAVIGATION_DISPLAY_MANUAL_JOYSTICK.')
+            return None
+
+        if pygame is None:
+            print('pygame non installe: mode manuel clavier uniquement.')
+            return None
+
+        joystick_hint = os.environ.get('NAVIGATION_DISPLAY_JOYSTICK_NAME', '').strip()
+        try:
+            source = ManualJoystickSource(joystick_name_hint=joystick_hint)
+            print('Mode manuel combine: clavier + joystick USB.')
+            return source
+        except Exception as exc:
+            print(f'Joystick USB indisponible ({exc}). Fallback clavier uniquement.')
         return None
 
     if mode == MODE_XPLANE:
@@ -587,7 +693,7 @@ class RPMGauge(QWidget):
         if self.title.upper() == 'RPM':
             interval = (self.max_val - self.min_val) / self.step_count
             self.red_zone_threshold = self.max_val - 1.5 * interval
-        self.setMinimumSize(198, 162)
+        self.setMinimumSize(168, 118)
 
     def setValue(self, value):
         self.value = max(self.min_val, min(self.max_val, value))
@@ -802,7 +908,7 @@ class SegmentedLinearGauge(QWidget):
         zones,
         value_formatter=None,
         min_width=234,
-        min_height=81,
+        min_height=62,
         title_font_size=13,
         value_font_size=12,
         base_line_position='bottom',
@@ -1756,6 +1862,426 @@ class GreeceMapWidget(QWidget):
 
         layout.addStretch()
 
+
+class VolantaWidget(QWidget):
+
+    FLIGHTRADAR_URL = 'https://www.flightradar24.com/'
+    VOLANTA_URL = 'https://fly.volanta.app/'
+    ADSB_EXCHANGE_URL = 'https://globe.adsbexchange.com/'
+    ADSB_EXCHANGE_FALLBACK_URL = 'https://globe.adsb.fi/'
+    DESKTOP_UA = (
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
+        'AppleWebKit/537.36 (KHTML, like Gecko) '
+        'Chrome/123.0.0.0 Safari/537.36'
+    )
+    MODAL_AUTO_CLOSE_JS = """
+        (function() {
+            function isVisible(el) {
+                if (!el || !el.getBoundingClientRect) return false;
+                var style = window.getComputedStyle(el);
+                if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+                var rect = el.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+            }
+
+            function isLikelyModal(el) {
+                if (!isVisible(el)) return false;
+                var style = window.getComputedStyle(el);
+                var rect = el.getBoundingClientRect();
+                var fixedish = style.position === 'fixed' || style.position === 'sticky' || style.position === 'absolute';
+                var z = parseInt(style.zIndex || '0', 10);
+                var className = (el.className || '').toString().toLowerCase();
+                var role = (el.getAttribute('role') || '').toLowerCase();
+                var hinted = (
+                    role === 'dialog' ||
+                    className.indexOf('modal') >= 0 ||
+                    className.indexOf('popup') >= 0 ||
+                    className.indexOf('dialog') >= 0 ||
+                    className.indexOf('tour') >= 0
+                );
+                var largeEnough = rect.width >= Math.min(280, window.innerWidth * 0.35) && rect.height >= Math.min(180, window.innerHeight * 0.22);
+                return largeEnough && (hinted || (fixedish && z >= 10));
+            }
+
+            function closeWithinModal(modal) {
+                var modalRect = modal.getBoundingClientRect();
+                var nodes = Array.from(modal.querySelectorAll('button, [role="button"], a, div, span'));
+                for (var i = 0; i < nodes.length; i += 1) {
+                    var el = nodes[i];
+                    if (!isVisible(el)) continue;
+                    var rect = el.getBoundingClientRect();
+                    if (rect.width > 64 || rect.height > 64) continue;
+                    var nearTopRight = rect.right >= modalRect.right - 130 && rect.top <= modalRect.top + 130;
+                    if (!nearTopRight) continue;
+                    var text = (el.innerText || el.textContent || '').trim().toLowerCase();
+                    var aria = (el.getAttribute('aria-label') || '').trim().toLowerCase();
+                    var title = (el.getAttribute('title') || '').trim().toLowerCase();
+                    var cls = (el.className || '').toString().toLowerCase();
+                    var hasCloseHint = (
+                        text === 'x' || text === '×' || text === 'close' || text === 'fermer' ||
+                        aria.indexOf('close') >= 0 || aria.indexOf('fermer') >= 0 ||
+                        title.indexOf('close') >= 0 || cls.indexOf('close') >= 0 || cls.indexOf('dismiss') >= 0
+                    );
+                    if (!hasCloseHint && !(rect.width <= 40 && rect.height <= 40)) continue;
+                    try {
+                        el.click();
+                        return true;
+                    } catch (err) {
+                    }
+                }
+                return false;
+            }
+
+            var blocks = Array.from(document.querySelectorAll('[role="dialog"], .modal, .popup, .dialog, div, section, article'));
+            for (var i = 0; i < blocks.length; i += 1) {
+                var block = blocks[i];
+                if (!isLikelyModal(block)) continue;
+                if (closeWithinModal(block)) {
+                    break;
+                }
+            }
+        })();
+    """
+    VOLANTA_UI_CLEANUP_JS = """
+        (function() {
+            function hideNode(node) {
+                if (!node) return;
+                node.style.setProperty('display', 'none', 'important');
+                node.style.setProperty('visibility', 'hidden', 'important');
+                node.style.setProperty('opacity', '0', 'important');
+                node.style.setProperty('pointer-events', 'none', 'important');
+            }
+
+            function hideByText(targetText) {
+                var target = targetText.toLowerCase();
+                var nodes = Array.from(document.querySelectorAll('button, a, div, span'));
+                for (var i = 0; i < nodes.length; i += 1) {
+                    var el = nodes[i];
+                    if (!el || !el.getBoundingClientRect) continue;
+                    var text = (el.innerText || el.textContent || '').trim().toLowerCase();
+                    if (!text || text.indexOf(target) < 0) continue;
+                    var rect = el.getBoundingClientRect();
+                    if (rect.top > 180 || rect.height > 90 || rect.width > 300) continue;
+                    hideNode(el);
+                }
+            }
+
+            hideByText('download app');
+
+            var logoNodes = document.querySelectorAll('img[alt*="volanta" i], img[src*="volanta" i], [data-testid*="logo" i]');
+            for (var i = 0; i < logoNodes.length; i += 1) {
+                var logo = logoNodes[i];
+                if (!logo || !logo.getBoundingClientRect) continue;
+                var rect = logo.getBoundingClientRect();
+                if (rect.top <= 170 && rect.left <= 260 && rect.height <= 100) {
+                    hideNode(logo);
+                }
+            }
+
+            var brandLabels = Array.from(document.querySelectorAll('span, div, a'));
+            for (var i = 0; i < brandLabels.length; i += 1) {
+                var label = brandLabels[i];
+                if (!label || !label.getBoundingClientRect) continue;
+                var txt = (label.innerText || label.textContent || '').trim().toLowerCase();
+                if (txt !== 'volanta') continue;
+                var r = label.getBoundingClientRect();
+                if (r.top <= 170 && r.left <= 260 && r.height <= 80) {
+                    hideNode(label);
+                }
+            }
+        })();
+    """
+    ADSB_403_CHECK_JS = """
+        (function() {
+            var text = '';
+            try {
+                text = ((document.body && document.body.innerText) || '').toLowerCase();
+            } catch (err) {
+                return false;
+            }
+            return (
+                text.indexOf('problem fetching data from the server: 403') >= 0 ||
+                text.indexOf('problem fetching data from the server') >= 0 ||
+                text.indexOf('error 403') >= 0 ||
+                text.indexOf('forbidden') >= 0
+            );
+        })();
+    """
+    EMBED_MODE_JS = """
+        (function() {
+            if (!window.__ndVolanta) {
+                window.__ndVolanta = {};
+            }
+
+            function looksLikeMapObject(value) {
+                return value && typeof value.getZoom === 'function'
+                    && (typeof value.zoomIn === 'function' || typeof value.zoomOut === 'function' || typeof value.zoomTo === 'function');
+            }
+
+            function findMap() {
+                if (looksLikeMapObject(window.__ndVolanta.map)) {
+                    return window.__ndVolanta.map;
+                }
+                if (looksLikeMapObject(window.map)) {
+                    window.__ndVolanta.map = window.map;
+                    return window.map;
+                }
+                try {
+                    var keys = Object.keys(window);
+                    for (var i = 0; i < keys.length; i += 1) {
+                        var candidate = window[keys[i]];
+                        if (looksLikeMapObject(candidate)) {
+                            window.__ndVolanta.map = candidate;
+                            return candidate;
+                        }
+                    }
+                } catch (err) {
+                }
+                return null;
+            }
+
+            function zoomMap(step) {
+                var map = findMap();
+                if (!map) {
+                    return false;
+                }
+                try {
+                    if (step > 0 && typeof map.zoomIn === 'function') {
+                        map.zoomIn({ duration: 80 });
+                        return true;
+                    }
+                    if (step < 0 && typeof map.zoomOut === 'function') {
+                        map.zoomOut({ duration: 80 });
+                        return true;
+                    }
+                    if (typeof map.getZoom === 'function' && typeof map.zoomTo === 'function') {
+                        var current = map.getZoom();
+                        map.zoomTo(current + (step > 0 ? 0.6 : -0.6), { duration: 80 });
+                        return true;
+                    }
+                } catch (err) {
+                }
+                return false;
+            }
+
+            function hideChrome() {
+                var viewportW = window.innerWidth || 0;
+                var viewportH = window.innerHeight || 0;
+                var nodes = Array.from(document.querySelectorAll('header, nav, aside, [role="navigation"], [class*="side"], [class*="Side"], [class*="top"], [class*="Top"]'));
+                for (var i = 0; i < nodes.length; i += 1) {
+                    var el = nodes[i];
+                    if (!el || !el.getBoundingClientRect) {
+                        continue;
+                    }
+                    var style = window.getComputedStyle(el);
+                    var rect = el.getBoundingClientRect();
+                    var fixedish = style.position === 'fixed' || style.position === 'sticky';
+                    if (!fixedish) {
+                        continue;
+                    }
+                    var topBanner = rect.top <= 6 && rect.height <= 130 && rect.width >= viewportW * 0.35;
+                    var leftRail = rect.left <= 6 && rect.width <= 130 && rect.height >= viewportH * 0.3;
+                    if (topBanner || leftRail) {
+                        el.style.setProperty('display', 'none', 'important');
+                        el.style.setProperty('visibility', 'hidden', 'important');
+                        el.style.setProperty('opacity', '0', 'important');
+                        el.style.setProperty('pointer-events', 'none', 'important');
+                    }
+                }
+
+                var mapRoots = Array.from(document.querySelectorAll('.mapboxgl-map, .leaflet-container, .mapboxgl-canvas-container'));
+                for (var i = 0; i < mapRoots.length; i += 1) {
+                    var mapRoot = mapRoots[i];
+                    if (!mapRoot) continue;
+                    mapRoot.style.setProperty('display', 'block', 'important');
+                    mapRoot.style.setProperty('visibility', 'visible', 'important');
+                    mapRoot.style.setProperty('opacity', '1', 'important');
+                }
+
+                document.body.style.setProperty('margin', '0', 'important');
+                document.body.style.setProperty('padding', '0', 'important');
+            }
+
+            if (!window.__ndVolanta.zoomHookInstalled) {
+                window.__ndVolanta.zoomHookInstalled = true;
+
+                window.addEventListener('wheel', function(event) {
+                    if (!(event.ctrlKey || event.metaKey)) {
+                        return;
+                    }
+                    var step = event.deltaY < 0 ? 1 : -1;
+                    if (zoomMap(step)) {
+                        event.preventDefault();
+                        event.stopPropagation();
+                    }
+                }, { capture: true, passive: false });
+
+                window.addEventListener('keydown', function(event) {
+                    if (!(event.ctrlKey || event.metaKey)) {
+                        return;
+                    }
+                    var key = event.key;
+                    if (key === '+' || key === '=' || key === '-') {
+                        if (zoomMap(key === '-' ? -1 : 1)) {
+                            event.preventDefault();
+                            event.stopPropagation();
+                        }
+                    } else if (key === '0') {
+                        event.preventDefault();
+                        event.stopPropagation();
+                    }
+                }, true);
+            }
+
+            hideChrome();
+            setTimeout(hideChrome, 180);
+            setTimeout(hideChrome, 900);
+        })();
+        """
+
+    @classmethod
+    def mode_config(cls, mode):
+        if mode == MODE_MANUAL:
+            return ('Flight Radar', cls.FLIGHTRADAR_URL, False)
+        if mode == MODE_MSP:
+            return ('ADS-B Exchange', cls.ADSB_EXCHANGE_FALLBACK_URL, False)
+        return ('Volanta', cls.VOLANTA_URL, True)
+
+    @classmethod
+    def tab_title_for_mode(cls, mode):
+        title, _, _ = cls.mode_config(mode)
+        return title
+
+    def __init__(self, mode=MODE_XPLANE):
+
+        super().__init__()
+
+        self.site_title, self.site_url, self._use_embed_mode = self.mode_config(mode)
+        self._adsb_fallback_used = False
+
+        self.setStyleSheet('background-color: #1a1d24;')
+
+        layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        self.setLayout(layout)
+
+        self.web_view = None
+        self._sync_timer = QTimer(self)
+        self._sync_timer.setInterval(900)
+        self._sync_timer.timeout.connect(self._sync_embed_mode)
+
+        if QWebEngineView is None:
+            self._build_placeholder(
+                f'PyQtWebEngine est requis pour afficher {self.site_title}.\nInstallez pyqtwebengine.',
+                open_url=self.site_url,
+            )
+            return
+
+        try:
+            self.web_view = QWebEngineView()
+            self.web_view.setContextMenuPolicy(NO_CONTEXT_MENU)
+            page = self.web_view.page()
+            if page is not None:
+                profile = page.profile()
+                if profile is not None:
+                    profile.setHttpUserAgent(self.DESKTOP_UA)
+            layout.addWidget(self.web_view)
+            self.web_view.loadFinished.connect(self._on_page_loaded)
+            self.web_view.load(QUrl(self.site_url))
+        except Exception as exc:
+            self.web_view = None
+            self._build_placeholder(
+                f'Erreur lors du chargement de {self.site_title} : {exc}',
+                open_url=self.site_url,
+            )
+
+    def _on_page_loaded(self, ok):
+        if not ok:
+            return
+        self._sync_embed_mode()
+        if not self._sync_timer.isActive():
+            self._sync_timer.start()
+
+    def _sync_embed_mode(self):
+        if not self.web_view:
+            return
+        try:
+            if abs(float(self.web_view.zoomFactor()) - 1.0) > 0.0001:
+                self.web_view.setZoomFactor(1.0)
+        except Exception:
+            pass
+        page = self.web_view.page()
+        if page is None:
+            return
+        page.runJavaScript(self.MODAL_AUTO_CLOSE_JS)
+        if self._use_embed_mode:
+            page.runJavaScript(self.EMBED_MODE_JS)
+            page.runJavaScript(self.VOLANTA_UI_CLEANUP_JS)
+        if self.site_title == 'ADS-B Exchange':
+            page.runJavaScript(self.ADSB_403_CHECK_JS, self._on_adsb_403_check)
+
+    def _on_adsb_403_check(self, has_403):
+        if not has_403 or self._adsb_fallback_used or not self.web_view:
+            return
+        self._adsb_fallback_used = True
+        print('ADS-B Exchange: erreur 403 detectee, bascule automatique vers le fallback ADS-B.')
+        self.web_view.load(QUrl(self.ADSB_EXCHANGE_FALLBACK_URL))
+
+    def _open_external_url(self, url):
+        try:
+            webbrowser.open(url)
+        except Exception as exc:
+            print(f'Impossible d ouvrir le navigateur: {exc}')
+
+    def _build_placeholder(self, message, open_url=None):
+        self._sync_timer.stop()
+        layout = self.layout()
+
+        if layout is None:
+            layout = QVBoxLayout(self)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.setSpacing(0)
+
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+        layout.setContentsMargins(40, 40, 40, 40)
+        layout.setSpacing(12)
+
+        title = QLabel(self.site_title.upper())
+        title.setAlignment(ALIGN_CENTER)
+        title.setStyleSheet('color: #7cfaff; font: bold 20px Arial;')
+
+        content = QLabel(message)
+        content.setWordWrap(True)
+        content.setAlignment(ALIGN_CENTER)
+        content.setStyleSheet('color: white; font: 14px Arial;')
+
+        open_button = None
+        if open_url:
+            open_button = QPushButton(f'Ouvrir {self.site_title} dans le navigateur')
+            open_button.setCursor(POINTING_HAND_CURSOR)
+            open_button.setStyleSheet(
+                'QPushButton { background: #0b7285; color: white; border: none; '
+                'padding: 10px 16px; border-radius: 6px; font: bold 13px Arial; } '
+                'QPushButton:hover { background: #1098ad; }'
+            )
+            open_button.clicked.connect(
+                lambda _checked=False, target=open_url: self._open_external_url(target)
+            )
+
+        layout.addStretch()
+        layout.addWidget(title)
+        layout.addSpacing(12)
+        layout.addWidget(content)
+        if open_button is not None:
+            layout.addWidget(open_button)
+        layout.addStretch()
+
 class Tar1090Widget(QWidget):
     """Widget affichant la carte tar1090 (ADS-B) servie localement."""
 
@@ -2082,7 +2608,7 @@ class NavigationDisplayWidget(QWidget):
 
         self.setFocusPolicy(STRONG_FOCUS)
 
-        self.setMinimumSize(560, 520)
+        self.setMinimumSize(360, 300)
 
         self.mode_index = 1
 
@@ -2781,7 +3307,7 @@ class EngineDisplay(QWidget):
 
         self.setWindowTitle('X-Plane 1000 Navigation Display')
 
-        self.setGeometry(30, 30, 1520, 920)
+        self.setGeometry(50, 40, 980, 660)
 
         self.setStyleSheet('background-color: #050505;')
 
@@ -2910,8 +3436,12 @@ class EngineDisplay(QWidget):
             self.source_status = 'SRC MSP CONNECTING'
             self.source_color = '#ffd166'
         else:
-            self.source_status = 'SRC MANUAL'
-            self.source_color = '#a9b4c6'
+            if self.data_source is not None:
+                self.source_status = 'SRC JOYSTICK USB'
+                self.source_color = '#69f0ae'
+            else:
+                self.source_status = 'SRC MANUAL'
+                self.source_color = '#a9b4c6'
 
 
 
@@ -2924,7 +3454,7 @@ class EngineDisplay(QWidget):
 
         left_col = QVBoxLayout()
 
-        left_col.setSpacing(6)
+        left_col.setSpacing(3)
 
         self.rpm_widget = RPMGauge()
 
@@ -2945,6 +3475,23 @@ class EngineDisplay(QWidget):
         self.fuel_temp_widget = FuelTemperatureGauge()
 
         self.fuel_qty_gal_widget = FuelQuantityGauge()
+
+        # Keep the engine strip compact to avoid forcing a near full-screen window height.
+        self.rpm_widget.setMinimumHeight(108)
+        self.rpm_widget.setMaximumHeight(108)
+        self.load_widget.setMinimumHeight(108)
+        self.load_widget.setMaximumHeight(108)
+        self.fflow_widget.setMinimumHeight(42)
+        self.fflow_widget.setMaximumHeight(42)
+        for gauge in (
+            self.oil_psi_widget,
+            self.oil_temp_widget,
+            self.egt_widget,
+            self.fuel_temp_widget,
+            self.fuel_qty_gal_widget,
+        ):
+            gauge.setMinimumHeight(58)
+            gauge.setMaximumHeight(58)
 
         left_col.addWidget(self.fflow_widget)
 
@@ -2968,14 +3515,17 @@ class EngineDisplay(QWidget):
 
         self.greece_widget = GreeceMapWidget()
 
+        self._mode_map_tab_title = VolantaWidget.tab_title_for_mode(self.startup_mode)
+        self.volanta_widget = VolantaWidget(mode=self.startup_mode)
+
         # Start local ADS-B services before creating the embedded radar web view.
         self._start_local_services()
 
         self.tar1090_widget = Tar1090Widget()
 
-        for widget in (self.gps, self.cap_widget, self.greece_widget, self.tar1090_widget):
+        for widget in (self.gps, self.cap_widget, self.greece_widget, self.volanta_widget, self.tar1090_widget):
 
-            widget.setMinimumSize(600, 600)
+            widget.setMinimumSize(380, 320)
 
         self.display_tabs = QTabWidget()
 
@@ -2984,6 +3534,8 @@ class EngineDisplay(QWidget):
         self.display_tabs.addTab(self.cap_widget, 'Cap')
 
         self.display_tabs.addTab(self.greece_widget, 'Greece Map')
+
+        self.display_tabs.addTab(self.volanta_widget, self._mode_map_tab_title)
 
         self.display_tabs.addTab(self.tar1090_widget, 'ADS-B Radar')
 
@@ -3045,12 +3597,11 @@ class EngineDisplay(QWidget):
         screen_layout.setContentsMargins(8, 8, 8, 8)
         screen_layout.setSpacing(8)
 
-        if self.show_side_panels:
-            engine_strip = QFrame()
-            engine_strip.setFixedWidth(258)
-            engine_strip.setStyleSheet('background-color: #090d12; border: 1px solid #3f4751;')
-            engine_strip.setLayout(left_col)
-            screen_layout.addWidget(engine_strip)
+        engine_strip = QFrame()
+        engine_strip.setFixedWidth(220)
+        engine_strip.setStyleSheet('background-color: #090d12; border: 1px solid #3f4751;')
+        engine_strip.setLayout(left_col)
+        screen_layout.addWidget(engine_strip)
 
         center_display = QFrame()
         center_display.setStyleSheet('background-color: #020406; border: 2px solid #aeb6c3;')
@@ -3072,10 +3623,11 @@ class EngineDisplay(QWidget):
         softkey_handlers = {
             'SYSTEM': self._action_tab_gps,
             'MAP': self._action_tab_greece,
+            'VOL': self._action_tab_volanta,
             'NAV': self._action_tab_cap,
             'DCLTR': self._action_mode_cycle,
         }
-        softkeys = SoftKeyStrip(['SYSTEM', '', 'MAP', '', '', '', '', '', 'NAV', '', 'DCLTR', ''], softkey_handlers)
+        softkeys = SoftKeyStrip(['SYSTEM', '', 'MAP', '', 'VOL', '', '', '', 'NAV', '', 'DCLTR', ''], softkey_handlers)
         bezel_layout.addWidget(softkeys)
 
         bezel_frame.setLayout(bezel_layout)
@@ -3253,6 +3805,9 @@ class EngineDisplay(QWidget):
 
     def _action_tab_greece(self):
         self.display_tabs.setCurrentWidget(self.greece_widget)
+
+    def _action_tab_volanta(self):
+        self.display_tabs.setCurrentWidget(self.volanta_widget)
 
     def _ensure_adsb_backend_running(self):
         if not self._is_http_service_healthy('127.0.0.1', 8081):
@@ -3488,31 +4043,39 @@ class EngineDisplay(QWidget):
 
     def update_display(self):
 
-        if self.startup_mode in (MODE_XPLANE, MODE_MSP) and self.data_source is not None:
+        if self.startup_mode in (MODE_XPLANE, MODE_MSP, MODE_MANUAL) and self.data_source is not None:
             try:
                 data = self.data_source.poll(timeout=0.0)
                 if data:
                     self._last_source_rx_time = time.monotonic()
-                    self.heading = float(data.get('heading', self.heading)) % 360
-                    self.track = float(data.get('track', self.track)) % 360
-                    self.ground_speed = float(data.get('ground_speed', self.ground_speed))
-                    self.lat = float(data.get('lat', self.lat))
-                    self.lon = float(data.get('lon', self.lon))
-                    self.rpm = int(max(0, min(3000, float(data.get('rpm', self.rpm)))))
-                    self.load = int(max(0, min(100, float(data.get('load', self.load)))))
-                    self.fflow = max(0.0, min(20.0, float(data.get('fflow', self.fflow))))
-                    self.oil_psi = max(0.0, min(100.0, float(data.get('oil_psi', self.oil_psi))) )
-                    self.oil_temp = int(max(50, min(300, float(data.get('oil_temp', self.oil_temp)))))
-                    self.egt = int(max(1000, min(1800, float(data.get('egt', self.egt)))))
-                    self.fuel_qty_L = int(max(0, min(100, float(data.get('fuel_qty_L', self.fuel_qty_L)))))
-                    self.fuel_qty_R = int(max(0, min(100, float(data.get('fuel_qty_R', self.fuel_qty_R)))))
+                    if self.startup_mode == MODE_MANUAL:
+                        heading_delta = float(data.get('heading_delta', 0.0))
+                        self.heading = (self.heading + heading_delta) % 360
+                        self.track = self.heading
+                        self.load = int(max(0, min(100, float(data.get('load', self.load)))))
+                        self.source_status = 'SRC JOYSTICK USB OK'
+                        self.source_color = '#69f0ae'
+                    else:
+                        self.heading = float(data.get('heading', self.heading)) % 360
+                        self.track = float(data.get('track', self.track)) % 360
+                        self.ground_speed = float(data.get('ground_speed', self.ground_speed))
+                        self.lat = float(data.get('lat', self.lat))
+                        self.lon = float(data.get('lon', self.lon))
+                        self.rpm = int(max(0, min(3000, float(data.get('rpm', self.rpm)))))
+                        self.load = int(max(0, min(100, float(data.get('load', self.load)))))
+                        self.fflow = max(0.0, min(20.0, float(data.get('fflow', self.fflow))))
+                        self.oil_psi = max(0.0, min(100.0, float(data.get('oil_psi', self.oil_psi))) )
+                        self.oil_temp = int(max(50, min(300, float(data.get('oil_temp', self.oil_temp)))))
+                        self.egt = int(max(1000, min(1800, float(data.get('egt', self.egt)))))
+                        self.fuel_qty_L = int(max(0, min(100, float(data.get('fuel_qty_L', self.fuel_qty_L)))))
+                        self.fuel_qty_R = int(max(0, min(100, float(data.get('fuel_qty_R', self.fuel_qty_R)))))
 
-                    if self.startup_mode == MODE_XPLANE:
-                        self.source_status = 'SRC XPLANE UDP OK'
-                        self.source_color = '#69f0ae'
-                    elif self.startup_mode == MODE_MSP:
-                        self.source_status = 'SRC MSP OK'
-                        self.source_color = '#69f0ae'
+                        if self.startup_mode == MODE_XPLANE:
+                            self.source_status = 'SRC XPLANE UDP OK'
+                            self.source_color = '#69f0ae'
+                        elif self.startup_mode == MODE_MSP:
+                            self.source_status = 'SRC MSP OK'
+                            self.source_color = '#69f0ae'
             except RuntimeError as exc:
                 if not self._source_error_reported:
                     print(exc)
@@ -3523,15 +4086,20 @@ class EngineDisplay(QWidget):
                 elif self.startup_mode == MODE_MSP:
                     self.source_status = 'SRC MSP ERROR'
                     self.source_color = '#ff6b6b'
+                elif self.startup_mode == MODE_MANUAL:
+                    self.source_status = 'SRC MANUAL (CLAVIER)'
+                    self.source_color = '#a9b4c6'
                 self.data_source = None
             except Exception:
                 pass
 
-        if self._last_source_rx_time is not None and self.startup_mode in (MODE_XPLANE, MODE_MSP):
+        if self._last_source_rx_time is not None and self.startup_mode in (MODE_XPLANE, MODE_MSP, MODE_MANUAL):
             age = time.monotonic() - self._last_source_rx_time
             if age > 1.0:
                 if self.startup_mode == MODE_XPLANE:
                     self.source_status = f'SRC XPLANE STALE {age:0.1f}s'
+                elif self.startup_mode == MODE_MANUAL:
+                    self.source_status = f'SRC JOYSTICK STALE {age:0.1f}s'
                 else:
                     self.source_status = f'SRC MSP STALE {age:0.1f}s'
                 self.source_color = '#ffd166'

@@ -2288,6 +2288,22 @@ class Tar1090Widget(QWidget):
     TAR1090_URL = 'http://127.0.0.1:8081/?noglobe'
     TAR1090_URL_SAFE = 'http://127.0.0.1:8081/?noglobe&pTracks'
 
+    @staticmethod
+    def _tar1090_http_dir():
+        return os.path.expanduser('~/tar1090/html')
+
+    @staticmethod
+    def _tar1090_installed():
+        if sys.platform.startswith('win'):
+            return False
+        http_dir = Tar1090Widget._tar1090_http_dir()
+        index_candidates = (
+            os.path.join(http_dir, 'index.html'),
+            os.path.join(http_dir, 'index.htm'),
+            os.path.join(http_dir, 'tar1090.html'),
+        )
+        return os.path.isdir(http_dir) and any(os.path.exists(path) for path in index_candidates)
+
     def __init__(self):
         super().__init__()
         self.setStyleSheet('background-color: #1a1d24;')
@@ -2308,6 +2324,13 @@ class Tar1090Widget(QWidget):
         self._reload_timer = QTimer(self)
         self._reload_timer.setSingleShot(True)
         self._reload_timer.timeout.connect(self.reload_page)
+
+        if not self._tar1090_installed():
+            self._build_placeholder(
+                'tar1090 n\'est pas installé localement.\n'
+                'L\'onglet ADS-B est désactivé tant que le service n\'est pas disponible.'
+            )
+            return
 
         autostart_setting = os.environ.get('NAVIGATION_DISPLAY_AUTOSTART_ADSB', '1').strip().lower()
         if autostart_setting in ('0', 'false', 'no'):
@@ -3810,6 +3833,8 @@ class EngineDisplay(QWidget):
         self.display_tabs.setCurrentWidget(self.volanta_widget)
 
     def _ensure_adsb_backend_running(self):
+        if not Tar1090Widget._tar1090_installed():
+            return
         if not self._is_http_service_healthy('127.0.0.1', 8081):
             self._start_local_services()
 
@@ -3876,6 +3901,9 @@ class EngineDisplay(QWidget):
 
     def _start_local_services(self):
 
+        if sys.platform.startswith('win') or not Tar1090Widget._tar1090_installed():
+            return
+
         autostart_setting = os.environ.get('NAVIGATION_DISPLAY_AUTOSTART_ADSB', '1').strip().lower()
         if autostart_setting in ('0', 'false', 'no'):
             print('Démarrage ADS-B automatique désactivé via NAVIGATION_DISPLAY_AUTOSTART_ADSB. '
@@ -3893,12 +3921,15 @@ class EngineDisplay(QWidget):
 
         self._repair_tar1090_db_assets(http_dir)
 
-        readsb_running = subprocess.run(
-            ['pgrep', '-x', 'readsb'],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        ).returncode == 0
+        try:
+            readsb_running = subprocess.run(
+                ['pgrep', '-x', 'readsb'],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            ).returncode == 0
+        except FileNotFoundError:
+            readsb_running = False
         port_open = False
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
@@ -3952,7 +3983,6 @@ class EngineDisplay(QWidget):
                     start_new_session=True,
                 )
             except FileNotFoundError:
-                print(f'Commande introuvable au démarrage: {command[0]}')
                 continue
             except Exception:
                 print(f'Impossible de démarrer: {command}')
